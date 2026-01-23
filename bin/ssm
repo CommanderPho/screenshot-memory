@@ -1,0 +1,12 @@
+#!/bin/bash
+# Wrapper script to filter noisy native messages on macOS
+# Resolve the real path of this script (works on macOS)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+exec bun "$SCRIPT_DIR/../dist/cli.js" "$@" 2> >(grep -v -E "(Context leak|msgtracer|Invalid resolution)" >&2)
