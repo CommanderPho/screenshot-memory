@@ -27,7 +27,7 @@ process.stdout.write = ((c: any, ...a: any[]) => _isNoise(String(c)) ? true : _o
 
 import { Command } from "commander";
 import chalk from "chalk";
-import { indexCommand, findCommand, watchCommand, statsCommand, interactiveSearch, ocrCommand, captionCommand } from "./commands/index.js";
+import { indexCommand, findCommand, watchCommand, statsCommand, interactiveSearch, ocrCommand, captionCommand, browseCommand } from "./commands/index.js";
 import { memoryExists } from "./core/memory.js";
 import { APP_VERSION, APP_NAME } from "./utils/constants.js";
 import { setLogLevel } from "./utils/logger.js";
@@ -96,6 +96,25 @@ program
   .description("Show index statistics and configuration")
   .option("--json", "Output as JSON")
   .action(statsCommand);
+
+// Browse command
+program
+  .command("browse [directory]")
+  .description("List indexed screenshots with metadata and OCR previews")
+  .option("--limit <n>", "rows per page", "20")
+  .option("--page <n>", "page number", "1")
+  .option("--status <status>", "filter by status: all|indexed|empty|failed", "all")
+  .option("--sort <key>", "sort by: date|path|size|status", "date")
+  .option("--desc", "sort descending (default for date)")
+  .option("--json", "output as JSON")
+  .option("--csv", "output as CSV")
+  .option("--full-text", "fetch full OCR text for each preview (slower)")
+  .option("--no-color", "disable color output")
+  .action((directory, options) => {
+    options.limit = parseInt(options.limit, 10);
+    options.page = parseInt(options.page, 10);
+    return browseCommand(directory, options);
+  });
 
 // OCR test command
 program
