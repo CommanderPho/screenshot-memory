@@ -289,12 +289,32 @@ print_header "Step 3: Vision & Embedding Models"
 $ollamaRunning = $false
 
 function Test-OllamaApi {
-    try {
-        $resp = Invoke-RestMethod -Uri "http://localhost:11434/api/tags" -Method Get -TimeoutSec 2 -ErrorAction Stop
-        return $true
-    } catch {
-        return $false
+    $hosts = @("http://127.0.0.1:11434", "http://localhost:11434")
+    foreach ($h in $hosts) {
+        try {
+            $resp = Invoke-RestMethod -Uri "$h/api/tags" -Method Get -TimeoutSec 2 -ErrorAction Stop
+            return $true
+        } catch {
+            # Continue checking next host
+        }
     }
+    return $false
+}
+
+function Get-OllamaModels {
+    $hosts = @("http://127.0.0.1:11434", "http://localhost:11434")
+    $allModels = @()
+    foreach ($h in $hosts) {
+        try {
+            $tags = Invoke-RestMethod -Uri "$h/api/tags" -Method Get -TimeoutSec 3 -ErrorAction Stop
+            if ($tags.models) {
+                $allModels += ($tags.models | ForEach-Object { $_.name })
+            }
+        } catch {
+            # Continue checking next host
+        }
+    }
+    return ($allModels | Select-Object -Unique)
 }
 
 if (Test-OllamaApi) {
@@ -330,15 +350,7 @@ if (Test-OllamaApi) {
 if ($ollamaRunning -and (-not $SkipModelDownload)) {
     print_step "Checking for vision model..."
 
-    $models = @()
-    try {
-        $tags = Invoke-RestMethod -Uri "http://localhost:11434/api/tags" -Method Get -TimeoutSec 5 -ErrorAction Stop
-        if ($tags.models) {
-            $models = $tags.models | ForEach-Object { $_.name }
-        }
-    } catch {
-        $models = @()
-    }
+    $models = Get-OllamaModels
 
     # Check Vision Model
     $hasVisionModel = $false
@@ -445,18 +457,54 @@ if (-not (Test-Path $targetBinDir)) {
 $cliPath = Join-Path $PSScriptRoot "dist\cli.js"
 
 # 1. Create cmd wrapper (for cmd.exe, PowerShell, and generic shells)
-$cmdContent = "@echo off`r`nbun `"$cliPath`" %*`r`n"
+$cmdContent = @"
+@echo off
+setlocal
+if "%OLLAMA_HOST%"=="" set "OLLAMA_HOST=http://127.0.0.1:11434"
+where bun >nul 2>nul
+if %errorlevel% equ 0 (
+  bun "$cliPath" %*
+) else if exist "%~dp0bun.exe" (
+  "%~dp0bun.exe" "$cliPath" %*
+) else if exist "%USERPROFILE%\.bun\bin\bun.exe" (
+  "%USERPROFILE%\.bun\bin\bun.exe" "$cliPath" %*
+) else (
+  node "$cliPath" %*
+)
+"@ + "`r`n"
+
 Set-Content -Path (Join-Path $targetBinDir "ssm.cmd") -Value $cmdContent -NoNewline -Encoding ASCII
 Set-Content -Path (Join-Path $targetBinDir "screenshot-memory.cmd") -Value $cmdContent -NoNewline -Encoding ASCII
 
 # 2. Create ps1 wrapper (for native PowerShell)
-$ps1Content = "& bun `"$cliPath`" @args`r`n"
+$ps1Content = @"
+if (-not `$env:OLLAMA_HOST) {
+    `$env:OLLAMA_HOST = "http://127.0.0.1:11434"
+}
+`$bunExe = (Get-Command bun -ErrorAction SilentlyContinue)?.Source
+if (-not `$bunExe) {
+    `$adjacent = Join-Path (Split-Path -Parent `$MyInvocation.MyCommand.Path) "bun.exe"
+    if (Test-Path `$adjacent) { `$bunExe = `$adjacent }
+    elseif (Test-Path "`$env:USERPROFILE\.bun\bin\bun.exe") { `$bunExe = "`$env:USERPROFILE\.bun\bin\bun.exe" }
+}
+if (`$bunExe) {
+    & `$bunExe "$cliPath" @args
+} else {
+    & node "$cliPath" @args
+}
+"@ + "`r`n"
+
 Set-Content -Path (Join-Path $targetBinDir "ssm.ps1") -Value $ps1Content -NoNewline -Encoding UTF8
 Set-Content -Path (Join-Path $targetBinDir "screenshot-memory.ps1") -Value $ps1Content -NoNewline -Encoding UTF8
 
 # 3. Create bash wrapper / symlink for Git Bash / MSYS2 / WSL if present
 $posixCliPath = $cliPath.Replace('\', '/')
-$bashContent = "#!/bin/sh`nexec bun `"$posixCliPath`" `"`$@`"`n"
+$bashContent = @"
+#!/bin/sh
+export OLLAMA_HOST="`$"{OLLAMA_HOST:-http://127.0.0.1:11434}"
+exec bun "$posixCliPath" "`$@"
+"@ + "`n"
+
 try {
     $bashScriptPath = Join-Path $targetBinDir "ssm"
     Set-Content -Path $bashScriptPath -Value $bashContent -NoNewline -Encoding ASCII

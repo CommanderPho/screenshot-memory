@@ -42,10 +42,20 @@ No cloud. No API keys. Everything runs locally.
 
 ## Install
 
+### macOS / Linux
+
 ```bash
 git clone https://github.com/memvid/screenshot-memory.git
 cd screenshot-memory
 ./setup.sh
+```
+
+### Windows (PowerShell)
+
+```powershell
+git clone https://github.com/memvid/screenshot-memory.git
+cd screenshot-memory
+.\setup.ps1
 ```
 
 The setup script handles everything - Bun, Ollama, the AI model, all of it.
@@ -53,7 +63,8 @@ The setup script handles everything - Bun, Ollama, the AI model, all of it.
 To uninstall:
 
 ```bash
-./setup.sh --remove
+./setup.sh --remove     # macOS/Linux
+.\setup.ps1 -Uninstall  # Windows
 ```
 
 ## Try it out

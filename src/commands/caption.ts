@@ -119,7 +119,7 @@ async function captionDirectory(
   options: CaptionCommandOptions
 ): Promise<void> {
   // Find all images
-  const pattern = join(directory, "**/*.{png,jpg,jpeg,webp,gif,bmp}");
+  const pattern = join(directory, "**/*.{png,jpg,jpeg,webp,gif,bmp}").replace(/\\/g, "/");
   const images = await glob(pattern, { nodir: true, absolute: true });
 
   if (images.length === 0) {

@@ -86,7 +86,7 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
   });
 
   // Find all images
-  const pattern = join(directory, "**", SUPPORTED_EXTENSIONS_GLOB);
+  const pattern = join(directory, "**", SUPPORTED_EXTENSIONS_GLOB).replace(/\\/g, "/");
   const imagePaths = await glob(pattern, {
     nodir: true,
     absolute: true,
