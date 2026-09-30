@@ -16,5 +16,7 @@
 			"path": "../../../AppData/Local/screenshot-memory"
 		}
 	],
-	"settings": {}
+	"settings": {
+		"specstory.cloudSync.enabled": "never"
+	}
 }

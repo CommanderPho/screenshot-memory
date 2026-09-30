@@ -18,7 +18,7 @@ export interface ProgressBarOptions {
 /**
  * Create a progress bar for indexing with elapsed time, ETA, rate, and live file tracking
  */
-export function createIndexingProgressBar(options: ProgressBarOptions): cliProgress.SingleBar {
+export function createIndexingProgressBar(_options: ProgressBarOptions): cliProgress.SingleBar {
   const bar = new cliProgress.SingleBar(
     {
       format: (_barOptions, params, payload) => {

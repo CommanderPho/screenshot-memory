@@ -378,7 +378,7 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
   }
 
   if (flushError) {
-    throw new IndexError(`Failed to store documents: ${flushError.message}`);
+    throw new IndexError(`Failed to store documents: ${(flushError as Error).message}`);
   }
 
   // Save final catalog
