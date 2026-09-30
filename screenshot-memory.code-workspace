@@ -14,7 +14,15 @@
 		{
 			"name": "Windows - AppData",
 			"path": "../../../AppData/Local/screenshot-memory"
-		}
+		},
+		{
+			"name": "Mac - Application Support",
+			"path": "~/Library/Application Support/screenshot-memory"
+		},
+		{
+			"name": "Mac - Config",
+			"path": "~/Library/Preferences/screenshot-memory-nodejs"
+		},
 	],
 	"settings": {
 		"specstory.cloudSync.enabled": "never"
