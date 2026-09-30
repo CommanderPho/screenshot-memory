@@ -107,6 +107,8 @@ If you want to search photos by what's in them (not just text), you need Ollama 
 ```bash
 brew install ollama
 ollama pull llava-phi3
+ollama pull nomic-embed-text # CPU embedding support
+ollama pull llama3.2-vision # biggest 7.8GB
 ollama serve
 ```
 
