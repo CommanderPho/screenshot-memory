@@ -188,6 +188,14 @@ export function nativeEmbeddingsUnavailable(err: unknown): boolean {
   return errorMessage(err).includes(NATIVE_UNAVAILABLE) || coreMlEmbeddingFailure(err);
 }
 
+/**
+ * A multi-document CoreML failure should be retried as smaller native batches.
+ * A single document, or any other error, is not split.
+ */
+export function shouldRetrySmallerNativeBatch(err: unknown, documentCount: number): boolean {
+  return documentCount > 1 && coreMlEmbeddingFailure(err);
+}
+
 function warnCoreMlFallbackOnce(): void {
   if (warnedCoreMlFallback) return;
   warnedCoreMlFallback = true;
@@ -222,23 +230,66 @@ async function putWithOllama(
 }
 
 /**
+ * Store with memvid's ONNX embedder. CoreML often rejects a large batch after
+ * a small one has already succeeded, so split and retry before giving up.
+ * A single document that still fails on an existing non-Ollama index is skipped.
+ */
+async function putNativeBatch(
+  mv: Memvid,
+  documents: PutManyInput[],
+  compressionLevel: number,
+  embeddingModel: string
+): Promise<void> {
+  try {
+    await mv.putMany(documents, {
+      compressionLevel,
+      enableEmbedding: true,
+      embeddingModel,
+    });
+    nativeLocalEmbeddings = true;
+  } catch (err) {
+    if (shouldRetrySmallerNativeBatch(err, documents.length)) {
+      const mid = Math.ceil(documents.length / 2);
+      await putNativeBatch(mv, documents.slice(0, mid), compressionLevel, embeddingModel);
+      await putNativeBatch(mv, documents.slice(mid), compressionLevel, embeddingModel);
+      return;
+    }
+
+    if (coreMlEmbeddingFailure(err) && documents.length === 1) {
+      let foreignIdentity = false;
+      try {
+        foreignIdentity = await hasNonOllamaVectorIdentity(mv);
+      } catch (statsErr) {
+        logger.debug(`Could not read embedding identity: ${errorMessage(statsErr)}`);
+        throw err;
+      }
+      if (foreignIdentity) {
+        const label = documents[0]?.title || documents[0]?.uri || "document";
+        logger.warn(
+          `Skipping "${label}": built-in embeddings failed on CoreML for this screenshot.`
+        );
+        return;
+      }
+    }
+
+    throw err;
+  }
+}
+
+/**
  * Store documents with memvid's ONNX embedder when this build supports it.
- * If the native library reports that local models are unavailable, or CoreML
- * fails while running them, retry once with Ollama and keep using Ollama for
- * the rest of the process.
+ * If the native library reports that local models are unavailable, or a single
+ * document still fails on CoreML in an empty index, retry with Ollama and keep
+ * using Ollama for the rest of the process.
  */
 export async function putDocuments(mv: Memvid, documents: PutManyInput[]): Promise<void> {
   const config = getConfig();
   const compressionLevel = config.indexing.compressionLevel;
+  const embeddingModel = memvidEmbeddingModel(config.indexing.embeddingModel);
 
   if (nativeLocalEmbeddings !== false) {
     try {
-      await mv.putMany(documents, {
-        compressionLevel,
-        enableEmbedding: true,
-        embeddingModel: memvidEmbeddingModel(config.indexing.embeddingModel),
-      });
-      nativeLocalEmbeddings = true;
+      await putNativeBatch(mv, documents, compressionLevel, embeddingModel);
       return;
     } catch (err) {
       if (!nativeEmbeddingsUnavailable(err)) throw err;

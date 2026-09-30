@@ -4,13 +4,13 @@ overview: CoreML can embed the existing small example index, then fails on a 50-
 todos:
   - id: split-native-batch
     content: On CoreML failure of a multi-document putMany, retry smaller native batches before any Ollama switch or mixed-identity error
-    status: pending
+    status: completed
   - id: skip-single-doc
     content: If one document still fails CoreML on an existing non-Ollama index, warn and skip it without failing the rest of the batch
-    status: pending
+    status: completed
   - id: split-test
     content: Add a bun test for when a CoreML error should split versus fall back
-    status: pending
+    status: completed
 isProject: false
 ---
 
