@@ -165,7 +165,7 @@ Lives at `~/.config/screenshot-memory/config.json`:
 
 **OCR is slow** → Use more workers: `ssm index -w 8`
 
-**No image preview** → `brew install chafa`
+**No image preview** → `brew install chafa` / `sudo apt install chafa`
 
 **Photos not being described** → Make sure Ollama is running: `ollama serve`
 
