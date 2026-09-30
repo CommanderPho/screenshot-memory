@@ -10,7 +10,7 @@ import {
   SearchError,
   MemoryNotInitializedError,
 } from "../utils/index.js";
-import { getLocalEmbedder } from "../embeddings/ollama.js";
+import { getLocalEmbedder, memoryUsesOllamaEmbeddings } from "../embeddings/ollama.js";
 
 export type SearchMode = "lex" | "sem" | "auto";
 
@@ -120,6 +120,9 @@ export async function search(
 
     // Perform search
     const useEmbeddings = searchOptions.mode === "sem" || searchOptions.mode === "auto";
+    const embedder = useEmbeddings && memoryUsesOllamaEmbeddings(await mv.stats())
+      ? getLocalEmbedder()
+      : undefined;
     const result = await mv.find(query, {
       mode: searchOptions.mode,
       k: searchOptions.limit * 3, // Request more for filtering/deduplication
@@ -127,7 +130,7 @@ export async function search(
       adaptive: searchOptions.adaptive,
       minRelevancy: searchOptions.minRelevancy,
       adaptiveStrategy: searchOptions.adaptiveStrategy as any,
-      ...(useEmbeddings ? { embedder: getLocalEmbedder() } : {}),
+      ...(embedder ? { embedder } : {}),
     });
 
     // Restore console/stderr

@@ -9,7 +9,7 @@ import { basename, join } from "node:path";
 import { getMemory, createMemory, memoryExists, getMemoryStats } from "./memory.js";
 import { initializeOcr, processImage, shutdownOcr, isValidImage } from "../ocr/index.js";
 import { describeImage, shutdownVision, isVisionAvailable } from "../vision/index.js";
-import { getLocalEmbedder } from "../embeddings/ollama.js";
+import { putDocuments } from "../embeddings/ollama.js";
 import {
   getConfig,
   logger,
@@ -281,18 +281,15 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
       for (let i = 0; i < documents.length; i += BATCH_INSERT_SIZE) {
         const batch = documents.slice(i, i + BATCH_INSERT_SIZE);
 
-        await mv.putMany(
+        await putDocuments(
+          mv,
           batch.map((doc) => ({
             title: doc.title,
             text: doc.text,
             labels: [doc.label],
             tags: doc.tags,
             metadata: doc.metadata,
-          })),
-          {
-            compressionLevel: config.indexing.compressionLevel,
-            embedder: getLocalEmbedder(),
-          }
+          }))
         );
 
         options.onProgress?.({
@@ -447,25 +444,22 @@ export async function indexSingleImage(
 
     // Add to index
     options?.onProgress?.("indexing", "Storing...");
-    await mv.putMany(
-      [{
-        text: combinedText,
-        title: basename(resolved),
-        labels: [DOCUMENT_LABEL],
-        tags: captionTags,
-        metadata: {
-          path: resolved,
-          timestamp: stats.mtime.getTime(),
-          fileSize: stats.size,
-          width: imageWidth,
-          height: imageHeight,
-          confidence: ocrConfidence,
-          hasCaption: !!captionText,
-          method,
-        },
-      }],
-      { embedder: getLocalEmbedder() }
-    );
+    await putDocuments(mv, [{
+      text: combinedText,
+      title: basename(resolved),
+      labels: [DOCUMENT_LABEL],
+      tags: captionTags,
+      metadata: {
+        path: resolved,
+        timestamp: stats.mtime.getTime(),
+        fileSize: stats.size,
+        width: imageWidth,
+        height: imageHeight,
+        confidence: ocrConfidence,
+        hasCaption: !!captionText,
+        method,
+      },
+    }]);
 
     // Shutdown if requested
     if (options?.shutdownOcrAfter) {

@@ -46,7 +46,7 @@ export const DEFAULT_CONFIG = {
   indexing: {
     batchSize: 100,
     compressionLevel: 3,
-    embeddingModel: "nomic-embed-text" as const,
+    embeddingModel: "bge-small" as const,
   },
 } as const;
 

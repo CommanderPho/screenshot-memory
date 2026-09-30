@@ -169,7 +169,7 @@ Lives at `~/.config/screenshot-memory/config.json`:
 
 **Photos not being described** → Make sure Ollama is running: `ollama serve`
 
-**Semantic index/search failed** → Pull the local embedding model (no API key): `ollama pull nomic-embed-text`
+**Semantic index/search failed** → If memvid's local embedding model is unavailable on this platform, pull the Ollama fallback (no API key): `ollama pull nomic-embed-text`
 
 ## License
 
