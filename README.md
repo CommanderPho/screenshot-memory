@@ -182,7 +182,7 @@ Lives at `~/.config/screenshot-memory/config.json`:
 
 **Photos not being described** → Make sure Ollama is running: `ollama serve`
 
-**Semantic index/search failed** → If memvid's local embedding model is unavailable on this platform, pull the Ollama fallback (no API key): `ollama pull nomic-embed-text`
+**Semantic index/search failed** → If memvid's local embedding model is unavailable, or macOS CoreML fails while running it (`Unable to compute the prediction using a neural network model`), pull the Ollama fallback (no API key): `ollama serve` then `ollama pull nomic-embed-text`. If an existing index was built with the built-in model, rebuild it with `ssm index --force`.
 
 ## License
 

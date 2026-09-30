@@ -10,7 +10,12 @@ import {
   SearchError,
   MemoryNotInitializedError,
 } from "../utils/index.js";
-import { getLocalEmbedder, memoryUsesOllamaEmbeddings } from "../embeddings/ollama.js";
+import {
+  coreMlEmbeddingFailure,
+  getLocalEmbedder,
+  memoryUsesOllamaEmbeddings,
+  OLLAMA_EMBED_MODEL,
+} from "../embeddings/ollama.js";
 
 export type SearchMode = "lex" | "sem" | "auto";
 
@@ -273,6 +278,13 @@ export async function search(
       throw new SearchError(
         "Vector index not enabled. Re-index to enable semantic search.",
         "Run 'ssm index --force' to rebuild the index."
+      );
+    }
+
+    if (coreMlEmbeddingFailure(err)) {
+      throw new SearchError(
+        "Semantic search failed because the built-in embedding model crashed on CoreML.",
+        `Install the Ollama fallback (\`ollama serve\`, then \`ollama pull ${OLLAMA_EMBED_MODEL}\`) and run \`ssm index --force\` to rebuild the index.`
       );
     }
 

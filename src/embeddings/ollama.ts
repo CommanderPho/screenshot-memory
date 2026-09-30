@@ -125,8 +125,15 @@ let instance: OllamaEmbeddings | null = null;
 
 /** null = not probed yet, false = this process must use Ollama. */
 let nativeLocalEmbeddings: boolean | null = null;
+let warnedCoreMlFallback = false;
 
 const NATIVE_UNAVAILABLE = "not available on this platform";
+
+const COREML_FAILURE_MARKERS = [
+  "CoreMLExecutionProvider",
+  "failed to compute embeddings with fastembed",
+  "Unable to compute the prediction using a neural network model",
+] as const;
 
 export function getLocalEmbedder(): OllamaEmbeddings {
   if (!instance) {
@@ -135,15 +142,58 @@ export function getLocalEmbedder(): OllamaEmbeddings {
   return instance;
 }
 
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** CoreML rejected memvid's built-in fastembed model at runtime. */
+export function coreMlEmbeddingFailure(err: unknown): boolean {
+  const message = errorMessage(err);
+  return COREML_FAILURE_MARKERS.some((marker) => message.includes(marker));
+}
+
 export function nativeEmbeddingsUnavailable(err: unknown): boolean {
-  const message = err instanceof Error ? err.message : String(err);
-  return message.includes(NATIVE_UNAVAILABLE);
+  return errorMessage(err).includes(NATIVE_UNAVAILABLE) || coreMlEmbeddingFailure(err);
+}
+
+function warnCoreMlFallbackOnce(): void {
+  if (warnedCoreMlFallback) return;
+  warnedCoreMlFallback = true;
+  logger.warn(
+    `Built-in embeddings failed on CoreML. Using Ollama model '${OLLAMA_EMBED_MODEL}' instead.`
+  );
+}
+
+function mixedIdentityMessage(): string {
+  return (
+    "Native embeddings failed, and this index already uses a different embedding model. " +
+    `Run \`ssm index --force\` to rebuild it with Ollama (\`ollama serve\`, then \`ollama pull ${OLLAMA_EMBED_MODEL}\`).`
+  );
+}
+
+/** True when stored vectors came from something other than the Ollama embedder. */
+async function hasNonOllamaVectorIdentity(mv: Memvid): Promise<boolean> {
+  const stats = await mv.stats();
+  const provider = stats.embedding_identity?.provider;
+  return typeof provider === "string" && provider.length > 0 && provider !== "ollama";
+}
+
+async function putWithOllama(
+  mv: Memvid,
+  documents: PutManyInput[],
+  compressionLevel: number
+): Promise<void> {
+  await mv.putMany(documents, {
+    compressionLevel,
+    embedder: getLocalEmbedder(),
+  });
 }
 
 /**
  * Store documents with memvid's ONNX embedder when this build supports it.
- * If the native library reports that local models are unavailable, retry once
- * with Ollama and keep using Ollama for the rest of the process.
+ * If the native library reports that local models are unavailable, or CoreML
+ * fails while running them, retry once with Ollama and keep using Ollama for
+ * the rest of the process.
  */
 export async function putDocuments(mv: Memvid, documents: PutManyInput[]): Promise<void> {
   const config = getConfig();
@@ -160,15 +210,38 @@ export async function putDocuments(mv: Memvid, documents: PutManyInput[]): Promi
       return;
     } catch (err) {
       if (!nativeEmbeddingsUnavailable(err)) throw err;
+
+      let foreignIdentity = false;
+      try {
+        foreignIdentity = await hasNonOllamaVectorIdentity(mv);
+      } catch (statsErr) {
+        logger.debug(`Could not read embedding identity: ${errorMessage(statsErr)}`);
+        throw err;
+      }
+      if (foreignIdentity) {
+        throw new Error(mixedIdentityMessage());
+      }
+
       nativeLocalEmbeddings = false;
-      logger.debug("Native local embeddings are unavailable on this platform; using Ollama");
+      if (coreMlEmbeddingFailure(err)) {
+        warnCoreMlFallbackOnce();
+      } else {
+        logger.debug("Native local embeddings are unavailable on this platform; using Ollama");
+      }
+
+      try {
+        await putWithOllama(mv, documents, compressionLevel);
+      } catch (ollamaErr) {
+        if (coreMlEmbeddingFailure(err)) {
+          throw new Error(`Built-in embeddings failed on CoreML. ${errorMessage(ollamaErr)}`);
+        }
+        throw ollamaErr;
+      }
+      return;
     }
   }
 
-  await mv.putMany(documents, {
-    compressionLevel,
-    embedder: getLocalEmbedder(),
-  });
+  await putWithOllama(mv, documents, compressionLevel);
 }
 
 export function memoryUsesOllamaEmbeddings(
