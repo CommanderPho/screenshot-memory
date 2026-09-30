@@ -87,7 +87,7 @@ export async function findCommand(
  * Interactive search (for future use)
  */
 export async function interactiveSearch(): Promise<void> {
-  // @ts-expect-error - inquirer types
+  // @ts-ignore - inquirer types
   const inquirer = (await import("inquirer")).default;
   const config = getConfig();
 
