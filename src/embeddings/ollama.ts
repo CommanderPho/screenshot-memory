@@ -9,6 +9,38 @@ import { getConfig, logger } from "../utils/index.js";
 export const OLLAMA_EMBED_MODEL = "nomic-embed-text";
 export const OLLAMA_EMBED_DIMENSION = 768;
 
+/**
+ * Memvid's native embedder accepts short aliases only.
+ * Config may use those aliases or the full provider model id.
+ */
+const MEMVID_EMBEDDING_ALIASES: Record<string, string> = {
+  "nomic": "nomic",
+  "nomic-embed-text": "nomic",
+  "nomic-embed-text-v1.5": "nomic",
+  "nomic-ai/nomic-embed-text-v1.5": "nomic",
+  "bge-small": "bge-small",
+  "bge-small-en-v1.5": "bge-small",
+  "baai/bge-small-en-v1.5": "bge-small",
+  "bge-base": "bge-base",
+  "bge-base-en-v1.5": "bge-base",
+  "baai/bge-base-en-v1.5": "bge-base",
+  "gte-large": "gte-large",
+  "thenlper/gte-large": "gte-large",
+  "openai-small": "openai-small",
+  "text-embedding-3-small": "openai-small",
+  "openai-large": "openai-large",
+  "openai": "openai-large",
+  "text-embedding-3-large": "openai-large",
+  "openai-ada": "openai-ada",
+  "text-embedding-ada-002": "openai-ada",
+};
+
+/** Map a configured model id onto a memvid embedding alias. Unknown names are unchanged. */
+export function memvidEmbeddingModel(name: string): string {
+  const normalized = name.trim().toLowerCase().replace(/:.*$/, "");
+  return MEMVID_EMBEDDING_ALIASES[normalized] ?? normalized;
+}
+
 const EMBED_TIMEOUT_MS = 120_000;
 
 export class OllamaEmbeddings implements EmbeddingProvider {
@@ -204,7 +236,7 @@ export async function putDocuments(mv: Memvid, documents: PutManyInput[]): Promi
       await mv.putMany(documents, {
         compressionLevel,
         enableEmbedding: true,
-        embeddingModel: config.indexing.embeddingModel,
+        embeddingModel: memvidEmbeddingModel(config.indexing.embeddingModel),
       });
       nativeLocalEmbeddings = true;
       return;
