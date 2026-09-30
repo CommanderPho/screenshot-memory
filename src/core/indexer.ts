@@ -9,6 +9,7 @@ import { basename, join } from "node:path";
 import { getMemory, createMemory, memoryExists, getMemoryStats } from "./memory.js";
 import { initializeOcr, processImage, shutdownOcr, isValidImage } from "../ocr/index.js";
 import { describeImage, shutdownVision, isVisionAvailable } from "../vision/index.js";
+import { getLocalEmbedder } from "../embeddings/ollama.js";
 import {
   getConfig,
   logger,
@@ -280,11 +281,19 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
       for (let i = 0; i < documents.length; i += BATCH_INSERT_SIZE) {
         const batch = documents.slice(i, i + BATCH_INSERT_SIZE);
 
-        await mv.putMany(batch, {
-          compressionLevel: config.indexing.compressionLevel,
-          enableEmbedding: true,
-          embeddingModel: config.indexing.embeddingModel,
-        });
+        await mv.putMany(
+          batch.map((doc) => ({
+            title: doc.title,
+            text: doc.text,
+            labels: [doc.label],
+            tags: doc.tags,
+            metadata: doc.metadata,
+          })),
+          {
+            compressionLevel: config.indexing.compressionLevel,
+            embedder: getLocalEmbedder(),
+          }
+        );
 
         options.onProgress?.({
           phase: "indexing",
@@ -347,7 +356,6 @@ export async function indexSingleImage(
     onProgress?: (phase: string, message: string) => void;
   }
 ): Promise<{ success: boolean; method: "ocr" | "caption" | "both" | "none" }> {
-  const config = getConfig();
   const resolved = resolvePath(imagePath);
 
   if (!existsSync(resolved)) {
@@ -439,24 +447,25 @@ export async function indexSingleImage(
 
     // Add to index
     options?.onProgress?.("indexing", "Storing...");
-    await mv.put({
-      text: combinedText,
-      title: basename(resolved),
-      label: DOCUMENT_LABEL,
-      tags: captionTags,
-      metadata: {
-        path: resolved,
-        timestamp: stats.mtime.getTime(),
-        fileSize: stats.size,
-        width: imageWidth,
-        height: imageHeight,
-        confidence: ocrConfidence,
-        hasCaption: !!captionText,
-        method,
-      },
-      enableEmbedding: true,
-      embeddingModel: config.indexing.embeddingModel,
-    });
+    await mv.putMany(
+      [{
+        text: combinedText,
+        title: basename(resolved),
+        labels: [DOCUMENT_LABEL],
+        tags: captionTags,
+        metadata: {
+          path: resolved,
+          timestamp: stats.mtime.getTime(),
+          fileSize: stats.size,
+          width: imageWidth,
+          height: imageHeight,
+          confidence: ocrConfidence,
+          hasCaption: !!captionText,
+          method,
+        },
+      }],
+      { embedder: getLocalEmbedder() }
+    );
 
     // Shutdown if requested
     if (options?.shutdownOcrAfter) {

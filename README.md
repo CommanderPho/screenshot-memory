@@ -169,6 +169,8 @@ Lives at `~/.config/screenshot-memory/config.json`:
 
 **Photos not being described** → Make sure Ollama is running: `ollama serve`
 
+**Semantic index/search failed** → Pull the local embedding model (no API key): `ollama pull nomic-embed-text`
+
 ## License
 
 MIT

@@ -234,9 +234,34 @@ if $OLLAMA_RUNNING; then
             print_info "You can download it later with: ollama pull llava-phi3"
         fi
     fi
+
+    print_step "Checking for embedding model..."
+    HAS_EMBED_MODEL=false
+    for model in nomic-embed-text nomic-embed-text:latest; do
+        if echo "$MODELS" | grep -q "^$model"; then
+            HAS_EMBED_MODEL=true
+            print_success "Embedding model found: $model"
+            break
+        fi
+    done
+
+    if ! $HAS_EMBED_MODEL; then
+        print_step "Downloading nomic-embed-text embedding model..."
+        print_info "Semantic search runs locally through Ollama. No API key."
+        echo ""
+
+        ollama pull nomic-embed-text
+
+        if [ $? -eq 0 ]; then
+            print_success "Embedding model downloaded"
+        else
+            print_warning "Failed to download embedding model."
+            print_info "You can download it later with: ollama pull nomic-embed-text"
+        fi
+    fi
 else
     print_warning "Skipping model download (Ollama not running)"
-    print_info "After starting Ollama, run: ollama pull llava-phi3"
+    print_info "After starting Ollama, run: ollama pull llava-phi3 && ollama pull nomic-embed-text"
 fi
 
 # ============================================
