@@ -40,17 +40,17 @@ export function getManifestPath(memoryPath: string): string {
  * In-memory representation of the index catalog
  */
 export class IndexCatalog {
-  private entries: Map<string, CatalogEntry>;
+  private _entries: Map<string, CatalogEntry>;
   private isDirty = false;
 
   constructor(
     public readonly manifestPath: string,
     initialEntries?: Record<string, CatalogEntry>
   ) {
-    this.entries = new Map();
+    this._entries = new Map();
     if (initialEntries) {
       for (const [key, value] of Object.entries(initialEntries)) {
-        this.entries.set(resolvePath(key), value);
+        this._entries.set(resolvePath(key), value);
       }
     }
   }
@@ -60,7 +60,7 @@ export class IndexCatalog {
    */
   isUpToDate(filePath: string, stat: { mtimeMs: number; size: number }): boolean {
     const key = resolvePath(filePath);
-    const existing = this.entries.get(key);
+    const existing = this._entries.get(key);
     if (!existing) return false;
 
     // Both mtime and size must match for it to be considered unchanged
@@ -75,7 +75,7 @@ export class IndexCatalog {
    * Get entry for a file
    */
   get(filePath: string): CatalogEntry | undefined {
-    return this.entries.get(resolvePath(filePath));
+    return this._entries.get(resolvePath(filePath));
   }
 
   /**
@@ -87,7 +87,7 @@ export class IndexCatalog {
     status: CatalogEntry["status"]
   ): void {
     const key = resolvePath(filePath);
-    this.entries.set(key, {
+    this._entries.set(key, {
       path: key,
       mtimeMs: stat.mtimeMs,
       size: stat.size,
@@ -102,7 +102,7 @@ export class IndexCatalog {
    */
   remove(filePath: string): boolean {
     const key = resolvePath(filePath);
-    const removed = this.entries.delete(key);
+    const removed = this._entries.delete(key);
     if (removed) this.isDirty = true;
     return removed;
   }
@@ -111,7 +111,7 @@ export class IndexCatalog {
    * Clear all entries
    */
   clear(): void {
-    this.entries.clear();
+    this._entries.clear();
     this.isDirty = true;
   }
 
@@ -119,7 +119,7 @@ export class IndexCatalog {
    * Get total number of entries
    */
   get size(): number {
-    return this.entries.size;
+    return this._entries.size;
   }
 
   /**
@@ -127,6 +127,13 @@ export class IndexCatalog {
    */
   get dirty(): boolean {
     return this.isDirty;
+  }
+
+  /**
+   * Get all catalog entries as an array (for browse/export)
+   */
+  allEntries(): CatalogEntry[] {
+    return Array.from(this._entries.values());
   }
 
   /**
@@ -139,7 +146,7 @@ export class IndexCatalog {
     const data: CatalogData = {
       version: CATALOG_VERSION,
       updatedAt: Date.now(),
-      entries: Object.fromEntries(this.entries),
+      entries: Object.fromEntries(this._entries),
     };
 
     const serialized = JSON.stringify(data, null, 2);
