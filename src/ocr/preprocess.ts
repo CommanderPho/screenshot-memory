@@ -5,7 +5,7 @@
 
 import sharp from "sharp";
 import { readFile } from "node:fs/promises";
-import { MAX_IMAGE_DIMENSION } from "../utils/constants.js";
+import { MAX_IMAGE_DIMENSION, MIN_IMAGE_DIMENSION } from "../utils/constants.js";
 import type { PreprocessedImage, ImageMetadata } from "./types.js";
 
 /**
@@ -21,6 +21,10 @@ export async function preprocessImage(imagePath: string): Promise<PreprocessedIm
   const metadata = await image.metadata();
   const originalWidth = metadata.width || 0;
   const originalHeight = metadata.height || 0;
+
+  if (originalWidth < MIN_IMAGE_DIMENSION || originalHeight < MIN_IMAGE_DIMENSION) {
+    throw new Error(`Image dimensions (${originalWidth}x${originalHeight}) too small for OCR`);
+  }
 
   // Calculate resize dimensions (keep aspect ratio)
   let targetWidth = originalWidth;
@@ -67,6 +71,10 @@ export async function preprocessBuffer(buffer: Buffer): Promise<PreprocessedImag
 
   const originalWidth = metadata.width || 0;
   const originalHeight = metadata.height || 0;
+
+  if (originalWidth < MIN_IMAGE_DIMENSION || originalHeight < MIN_IMAGE_DIMENSION) {
+    throw new Error(`Image dimensions (${originalWidth}x${originalHeight}) too small for OCR`);
+  }
 
   let targetWidth = originalWidth;
   let targetHeight = originalHeight;
@@ -122,7 +130,12 @@ export async function getImageMetadata(imagePath: string): Promise<ImageMetadata
 export async function isValidImage(imagePath: string): Promise<boolean> {
   try {
     const metadata = await sharp(imagePath).metadata();
-    return !!(metadata.width && metadata.height);
+    return !!(
+      metadata.width &&
+      metadata.height &&
+      metadata.width >= MIN_IMAGE_DIMENSION &&
+      metadata.height >= MIN_IMAGE_DIMENSION
+    );
   } catch {
     return false;
   }

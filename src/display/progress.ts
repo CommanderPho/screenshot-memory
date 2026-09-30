@@ -16,24 +16,72 @@ export interface ProgressBarOptions {
 }
 
 /**
- * Create a progress bar for indexing
+ * Create a progress bar for indexing with elapsed time, ETA, rate, and live file tracking
  */
 export function createIndexingProgressBar(options: ProgressBarOptions): cliProgress.SingleBar {
-  const format = options.format ||
-    `${chalk.cyan("{bar}")} ${chalk.white("{percentage}%")} | ` +
-    `${chalk.white("{value}/{total}")} | ` +
-    `${chalk.white("ETA: {eta}s")} | ` +
-    `${chalk.cyan("{filename}")}`;
-
   const bar = new cliProgress.SingleBar(
     {
-      format,
-      barCompleteChar: "█",
-      barIncompleteChar: "░",
+      format: (_barOptions, params, payload) => {
+        const terminalWidth = process.stdout.columns || 80;
+
+        // Visual bar length dynamically adapts to terminal width
+        const barLength = Math.max(10, Math.min(20, Math.floor(terminalWidth / 6)));
+        const progress = Math.max(0, Math.min(1, params.progress || 0));
+        const completeChars = Math.round(progress * barLength);
+        const incompleteChars = Math.max(0, barLength - completeChars);
+        const barStr = chalk.cyan("█".repeat(completeChars)) + chalk.gray("░".repeat(incompleteChars));
+
+        // Percentage
+        const pct = (progress * 100).toFixed(1).padStart(5, " ") + "%";
+
+        // Counts
+        const counts = `${formatNumber(params.value)}/${formatNumber(params.total)}`;
+
+        // Timing
+        const elapsedMs = Math.max(0, Date.now() - params.startTime);
+        const elapsedStr = formatDuration(elapsedMs);
+
+        // Rate & ETA
+        const rate = params.value > 0 && elapsedMs > 0 ? params.value / (elapsedMs / 1000) : 0;
+        const remaining = Math.max(0, params.total - params.value);
+        const etaMs = rate > 0 ? (remaining / rate) * 1000 : 0;
+        const etaStr = remaining === 0 ? "0s" : formatDuration(etaMs);
+        const rateStr = rate > 0 ? `${rate >= 10 ? Math.round(rate) : rate.toFixed(1)}/s` : "--/s";
+
+        // Worker & File status
+        let fileInfo = "";
+        if (payload?.filename) {
+          const workerPrefix = payload.workerCount && payload.workerCount > 1
+            ? (payload.workerId ? `[W${payload.workerId}] ` : `[${payload.workerCount}w] `)
+            : "";
+          const activeSuffix = payload.activeCount && payload.activeCount > 1
+            ? ` (+${payload.activeCount - 1})`
+            : "";
+          fileInfo = `${workerPrefix}${payload.filename}${activeSuffix}`;
+        }
+
+        const prefix = `${barStr} ${chalk.bold.white(pct)} | ${chalk.white(counts)} | ${chalk.yellow("⏱ " + elapsedStr)} | ${chalk.green("ETA: " + etaStr)} | ${chalk.gray(rateStr)}`;
+
+        // Strip ANSI codes to measure visible text width
+        const prefixClean = prefix.replace(/\u001b\[[0-9;]*m/g, "");
+        const separator = " | ";
+        const availableWidth = terminalWidth - prefixClean.length - separator.length - 1;
+
+        if (fileInfo && availableWidth > 8) {
+          let truncatedFile = fileInfo;
+          if (truncatedFile.length > availableWidth) {
+            truncatedFile = "..." + truncatedFile.slice(-(availableWidth - 3));
+          }
+          return `${prefix}${chalk.gray(separator)}${chalk.cyan(truncatedFile)}`;
+        }
+
+        return prefix;
+      },
       hideCursor: true,
       clearOnComplete: false,
-      stopOnComplete: true,
+      stopOnComplete: false,
       forceRedraw: true,
+      fps: 10,
     },
     cliProgress.Presets.shades_classic
   );

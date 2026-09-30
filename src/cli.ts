@@ -9,11 +9,21 @@
 const _origErr = console.error;
 const _origWarn = console.warn;
 const _origStderr = process.stderr.write.bind(process.stderr);
-const _isNoise = (s: string) => s.includes("Context leak") || s.includes("msgtracer") || s.includes("Warning: Invalid resolution");
+const _origStdout = process.stdout.write.bind(process.stdout);
+const _isNoise = (s: string) =>
+  s.includes("Context leak") ||
+  s.includes("msgtracer") ||
+  s.includes("Warning: Invalid resolution") ||
+  s.includes("Warning: Invalid dpi") ||
+  s.includes("Image too small to scale") ||
+  s.includes("Line cannot be recognized") ||
+  s.includes("cannot be recognized") ||
+  s.includes("min width of");
 
 console.error = (...a: unknown[]) => { if (!_isNoise(String(a[0] || ""))) _origErr.apply(console, a); };
 console.warn = (...a: unknown[]) => { if (!_isNoise(String(a[0] || ""))) _origWarn.apply(console, a); };
 process.stderr.write = ((c: any, ...a: any[]) => _isNoise(String(c)) ? true : _origStderr(c, ...a)) as any;
+process.stdout.write = ((c: any, ...a: any[]) => _isNoise(String(c)) ? true : _origStdout(c, ...a)) as any;
 
 import { Command } from "commander";
 import chalk from "chalk";

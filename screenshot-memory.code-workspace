@@ -4,7 +4,16 @@
 			"path": "."
 		},
 		{
-			"path": "../../.config/screenshot-memory-nodejs"
+			"name": "Unix - Config",
+			"path": "~/.config/screenshot-memory-nodejs"
+		},
+		{
+			"name": "Windows - Config",
+			"path": "../../../AppData/Roaming/screenshot-memory-nodejs"
+		},
+		{
+			"name": "Windows - AppData",
+			"path": "../../../AppData/Local/screenshot-memory"
 		}
 	],
 	"settings": {}

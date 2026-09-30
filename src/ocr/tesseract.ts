@@ -22,12 +22,19 @@ class TesseractEngine implements OcrEngine {
    * Initialize the OCR engine with a worker pool using scheduler
    */
   async initialize(options?: OcrEngineOptions): Promise<void> {
+    const targetWorkers = options?.workers || DEFAULT_CONFIG.ocr.workers;
+    const targetLanguage = options?.language || DEFAULT_CONFIG.ocr.language;
+
     if (this.initialized) {
-      return;
+      if (this.workerCount === targetWorkers && this.language === targetLanguage) {
+        return;
+      }
+      logger.debug(`Re-initializing Tesseract with ${targetWorkers} workers (was ${this.workerCount})`);
+      await this.shutdown();
     }
 
-    this.workerCount = options?.workers || DEFAULT_CONFIG.ocr.workers;
-    this.language = options?.language || DEFAULT_CONFIG.ocr.language;
+    this.workerCount = targetWorkers;
+    this.language = targetLanguage;
 
     logger.debug(`Initializing Tesseract with ${this.workerCount} workers`);
 
@@ -142,13 +149,18 @@ class TesseractEngine implements OcrEngine {
     const originalWarn = console.warn;
     const originalError = console.error;
     const originalStderr = process.stderr.write.bind(process.stderr);
+    const originalStdout = process.stdout.write.bind(process.stdout);
 
     const isNoise = (msg: string) =>
       msg.includes("resolution") ||
       msg.includes("dpi") ||
       msg.includes("msgtracer") ||
       msg.includes("Context leak") ||
-      msg.includes("Warning:");
+      msg.includes("Warning:") ||
+      msg.includes("Image too small to scale") ||
+      msg.includes("Line cannot be recognized") ||
+      msg.includes("cannot be recognized") ||
+      msg.includes("min width of");
 
     console.warn = (...args: unknown[]) => {
       if (isNoise(String(args[0] || ""))) return;
@@ -162,12 +174,17 @@ class TesseractEngine implements OcrEngine {
       if (isNoise(String(chunk))) return true;
       return originalStderr(chunk, ...args);
     }) as any;
+    process.stdout.write = ((chunk: any, ...args: any[]) => {
+      if (isNoise(String(chunk))) return true;
+      return originalStdout(chunk, ...args);
+    }) as any;
 
     return new Promise((resolve, reject) => {
       const restore = () => {
         console.warn = originalWarn;
         console.error = originalError;
         process.stderr.write = originalStderr;
+        process.stdout.write = originalStdout;
       };
 
       const timeout = setTimeout(() => {

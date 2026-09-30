@@ -23,20 +23,21 @@ let initialized = false;
  * Initialize the OCR engine
  */
 export async function initializeOcr(options?: OcrEngineOptions): Promise<void> {
-  if (initialized) {
-    return;
-  }
-
   const config = getConfig();
   const engine = config.ocr.engine;
-
-  logger.debug(`Initializing OCR engine: ${engine}`);
 
   const ocrOptions: OcrEngineOptions = {
     workers: options?.workers || config.ocr.workers,
     language: options?.language || config.ocr.language,
     ...options,
   };
+
+  if (initialized) {
+    await initializeTesseract(ocrOptions);
+    return;
+  }
+
+  logger.debug(`Initializing OCR engine: ${engine}`);
 
   if (engine === "paddle") {
     // Check if PaddleOCR is available

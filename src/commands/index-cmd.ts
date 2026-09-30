@@ -70,7 +70,16 @@ export async function indexCommand(
   if (!options.quiet) {
     console.log();
     console.log(chalk.bold.cyan("📸 screenshot-memory"));
-    console.log(chalk.white(`   Indexing: `) + chalk.cyan(directory));
+    console.log(chalk.white(`   Directory: `) + chalk.cyan(directory));
+    console.log(
+      chalk.white(`   Mode:      `) +
+      chalk.gray(options.force ? "Force re-index" : "Incremental") +
+      chalk.white(` · Workers: `) +
+      chalk.cyan(String(workers)) +
+      (options.caption !== undefined
+        ? chalk.white(` · Vision: `) + chalk.gray(options.caption ? "enabled" : "disabled")
+        : "")
+    );
     console.log();
   }
 
@@ -83,6 +92,7 @@ export async function indexCommand(
       directory,
       force: options.force,
       workers,
+      caption: options.caption,
       onProgress: (p: IndexProgress) => {
         if (options.quiet) return;
 
@@ -96,13 +106,18 @@ export async function indexCommand(
             case "scanning":
               progress.startPhase("scanning", "Scanning for screenshots...");
               break;
-            case "ocr":
+            case "ocr": {
+              const skipMsg =
+                p.alreadyIndexed && p.alreadyIndexed > 0
+                  ? chalk.dim(` (${formatNumber(p.alreadyIndexed)} already indexed, ${formatNumber(p.total)} to process)`)
+                  : "";
               progress.startProgressPhase(
                 "ocr",
                 p.total,
-                `Processing ${formatNumber(p.total)} screenshots...`
+                `Processing ${formatNumber(p.total)} screenshots...${skipMsg}`
               );
               break;
+            }
             case "indexing":
               progress.startProgressPhase(
                 "indexing",
@@ -111,7 +126,7 @@ export async function indexCommand(
               );
               break;
             case "finalizing":
-              progress.startPhase("finalizing", "Optimizing index...");
+              progress.startPhase("finalizing", p.message || "Optimizing index...");
               break;
           }
           lastPhase = p.phase;
@@ -121,6 +136,11 @@ export async function indexCommand(
         if (p.phase === "ocr" || p.phase === "indexing") {
           progress.update(p.current, {
             filename: p.currentFile ? basename(p.currentFile) : "",
+            workerCount: p.workerCount || workers,
+            activeCount: p.activeCount,
+            indexed: p.indexed,
+            skipped: p.skipped,
+            failed: p.failed,
           });
         }
       },
@@ -153,15 +173,27 @@ export async function indexCommand(
  * Display index results
  */
 function displayIndexResult(result: IndexResult): void {
+  const avgRate =
+    result.timeMs > 0 && result.indexed > 0
+      ? (result.indexed / (result.timeMs / 1000)).toFixed(1)
+      : undefined;
+
   console.log();
   console.log(chalk.green.bold("✅ Indexing complete!"));
   console.log();
   console.log(chalk.white.bold("   Summary"));
-  console.log(chalk.white(`   Indexed:     `) + chalk.cyan(`${formatNumber(result.indexed)} screenshots`));
-  console.log(chalk.white(`   Skipped:     `) + chalk.white(`${formatNumber(result.skipped)}`) + chalk.dim(` (no text or already indexed)`));
-  console.log(chalk.white(`   Failed:      `) + chalk.white(`${formatNumber(result.failed)}`));
-  console.log(chalk.white(`   Time:        `) + chalk.cyan(`${formatDuration(result.timeMs)}`));
-  console.log(chalk.white(`   Index size:  `) + chalk.cyan(`${formatBytes(result.indexSizeBytes)}`));
+  console.log(chalk.white(`   Total found:     `) + chalk.cyan(`${formatNumber(result.totalFound)} screenshots`));
+  if (result.alreadyIndexed !== undefined && result.alreadyIndexed > 0) {
+    console.log(chalk.white(`   Already indexed: `) + chalk.green(`${formatNumber(result.alreadyIndexed)}`) + chalk.dim(` (skipped)`));
+  }
+  console.log(chalk.white(`   Newly indexed:   `) + chalk.cyan(`${formatNumber(result.indexed)} screenshots`));
+  const otherSkipped = result.skipped - (result.alreadyIndexed || 0);
+  if (otherSkipped > 0) {
+    console.log(chalk.white(`   No text/empty:   `) + chalk.white(`${formatNumber(otherSkipped)}`) + chalk.dim(` (skipped)`));
+  }
+  console.log(chalk.white(`   Failed:          `) + (result.failed > 0 ? chalk.red(`${formatNumber(result.failed)}`) : chalk.white(`${formatNumber(result.failed)}`)));
+  console.log(chalk.white(`   Time elapsed:    `) + chalk.cyan(`${formatDuration(result.timeMs)}`) + (avgRate ? chalk.dim(` (${avgRate} files/s)`) : ""));
+  console.log(chalk.white(`   Index size:      `) + chalk.cyan(`${formatBytes(result.indexSizeBytes)}`));
   console.log();
   console.log(chalk.white(`   Memory: `) + chalk.dim(result.memoryPath));
   console.log();

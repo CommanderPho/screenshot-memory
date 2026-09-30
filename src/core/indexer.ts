@@ -1,12 +1,14 @@
 /**
  * Indexer module for screenshot-memory
- * Handles batch indexing of screenshots into memvid
+ * Handles batch and incremental indexing of screenshots into memvid
  */
 
 import { glob } from "glob";
 import { statSync, existsSync } from "node:fs";
 import { basename, join } from "node:path";
+import pLimit from "p-limit";
 import { getMemory, createMemory, memoryExists, getMemoryStats } from "./memory.js";
+import { loadCatalog, clearCatalog } from "./catalog.js";
 import { initializeOcr, processImage, shutdownOcr, isValidImage } from "../ocr/index.js";
 import { describeImage, shutdownVision, isVisionAvailable } from "../vision/index.js";
 import { putDocuments } from "../embeddings/ollama.js";
@@ -41,14 +43,23 @@ export interface IndexProgress {
   phase: "scanning" | "ocr" | "captioning" | "indexing" | "finalizing";
   current: number;
   total: number;
+  totalFound?: number;
+  alreadyIndexed?: number;
   currentFile?: string;
+  workerCount?: number;
+  activeCount?: number;
+  indexed?: number;
+  skipped?: number;
+  failed?: number;
   message?: string;
 }
 
 export interface IndexResult {
   /** Total images found */
   totalFound: number;
-  /** Images successfully indexed */
+  /** Images skipped because already indexed */
+  alreadyIndexed: number;
+  /** Images newly indexed */
   indexed: number;
   /** Images skipped (already indexed or no text) */
   skipped: number;
@@ -63,7 +74,7 @@ export interface IndexResult {
 }
 
 /**
- * Index screenshots from a directory
+ * Index screenshots from a directory with incremental change detection and streaming workers
  */
 export async function indexDirectory(options: IndexOptions): Promise<IndexResult> {
   const startTime = Date.now();
@@ -98,110 +109,168 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
 
   logger.debug(`Found ${imagePaths.length} images in ${directory}`);
 
+  // Load catalog
+  const catalog = await loadCatalog(config.memoryPath);
+
+  if (options.force) {
+    catalog.clear();
+    clearCatalog(config.memoryPath);
+  }
+
   // Get or create memory
   const isNewIndex = !memoryExists() || options.force;
   const mv = isNewIndex
     ? await createMemory()
     : await getMemory({ create: true });
 
-  // Get existing indexed paths (for incremental indexing)
-  const indexedPaths = new Set<string>();
-  if (!isNewIndex && !options.force) {
+  // Partition images: already indexed vs to-index
+  const toIndex: Array<{ path: string; stat: { mtimeMs: number; size: number } }> = [];
+  let alreadyIndexedCount = 0;
+
+  for (const p of imagePaths) {
     try {
-      const stats = await getMemoryStats();
-      if (stats.frameCount > 0) {
-        // We can't easily get all indexed paths from memvid
-        // So for incremental, we'll rely on file modification time
-        // This is a simplification - a production version might use a separate index
-        logger.debug(`Existing index has ${stats.frameCount} documents`);
+      const stats = statSync(p);
+      const fileStat = { mtimeMs: stats.mtime.getTime(), size: stats.size };
+      if (!options.force && catalog.isUpToDate(p, fileStat)) {
+        alreadyIndexedCount++;
+      } else {
+        toIndex.push({ path: p, stat: fileStat });
       }
-    } catch (err) {
-      logger.debug(`Could not get existing index stats: ${err}`);
+    } catch {
+      // File could not be statted (permissions, unlinked, etc.), skip
     }
   }
 
-  // Filter to unindexed images (simplified - indexes all if force or new)
-  const toIndex = options.force || isNewIndex
-    ? imagePaths
-    : imagePaths.filter(p => !indexedPaths.has(p));
+  // If all files are already up-to-date, finish early
+  if (toIndex.length === 0) {
+    options.onProgress?.({
+      phase: "finalizing",
+      current: 1,
+      total: 1,
+      message: "All screenshots are already indexed.",
+    });
 
-  logger.debug(`Will index ${toIndex.length} images`);
+    const finalStats = await getMemoryStats();
+    return {
+      totalFound: imagePaths.length,
+      alreadyIndexed: alreadyIndexedCount,
+      indexed: 0,
+      skipped: alreadyIndexedCount,
+      failed: 0,
+      timeMs: Date.now() - startTime,
+      memoryPath: config.memoryPath,
+      indexSizeBytes: finalStats.usedBytes,
+    };
+  }
+
+  const workerCount = Math.max(1, options.workers || config.ocr.workers || 4);
+  logger.debug(`Indexing with ${workerCount} workers (${toIndex.length} new/modified, ${alreadyIndexedCount} already indexed)`);
 
   // Initialize OCR
   options.onProgress?.({
     phase: "ocr",
     current: 0,
     total: toIndex.length,
-    message: "Initializing OCR engine...",
+    totalFound: imagePaths.length,
+    alreadyIndexed: alreadyIndexedCount,
+    workerCount,
+    message: `Initializing OCR engine (${workerCount} workers)...`,
   });
 
-  await initializeOcr({ workers: options.workers || config.ocr.workers });
+  await initializeOcr({ workers: workerCount });
 
   // Check if vision is available for photos
-  const visionAvailable = await isVisionAvailable();
+  const visionAvailable = options.caption !== false && (await isVisionAvailable());
   if (visionAvailable) {
-    logger.debug("Vision captioning available for photos");
+    logger.debug("Vision captioning enabled for photos");
   }
 
-  // Process images with OCR + Vision
-  const documents: Array<{
-    text: string;
+  // Multi-worker concurrency pipeline using p-limit
+  const limit = pLimit(workerCount);
+  const activeWorkers = new Map<number, string>();
+  let workerSlotCounter = 0;
+
+  let processed = 0;
+  let indexed = 0;
+  let skippedNoText = 0;
+  let failed = 0;
+
+  // Buffer for periodic batch insertion into Memvid
+  const pendingDocs: Array<{
     title: string;
-    label: string;
-    tags?: string[];
+    text: string;
+    uri: string;
+    labels: string[];
+    tags: string[];
     metadata: Record<string, unknown>;
   }> = [];
 
-  let processed = 0;
-  let failed = 0;
-  let skipped = 0;
+  let isFlushing = false;
+  let flushError: Error | null = null;
 
-  // Process in batches to manage memory
-  const batchSize = 50;
-  for (let i = 0; i < toIndex.length; i += batchSize) {
-    const batch = toIndex.slice(i, i + batchSize);
+  async function flushPendingDocs() {
+    if (pendingDocs.length === 0 || isFlushing) return;
+    isFlushing = true;
+    const chunk = pendingDocs.splice(0, pendingDocs.length);
+    try {
+      await putDocuments(mv, chunk);
+      catalog.save();
+    } catch (err) {
+      flushError = err instanceof Error ? err : new Error(String(err));
+      logger.debug(`Error flushing documents to memory: ${flushError.message}`);
+    } finally {
+      isFlushing = false;
+    }
+  }
 
-    const batchPromises = batch.map(async (imagePath) => {
+  const tasks = toIndex.map((item) =>
+    limit(async () => {
+      const slotId = ++workerSlotCounter;
+      const fileName = basename(item.path);
+      activeWorkers.set(slotId, fileName);
+
       try {
-        // Check if valid image
-        const valid = await isValidImage(imagePath);
+        // Quick validity check (dimensions >= 10px, readable format)
+        const valid = await isValidImage(item.path);
         if (!valid) {
-          skipped++;
+          skippedNoText++;
           processed++;
+          catalog.record(item.path, item.stat, "empty");
+          activeWorkers.delete(slotId);
           options.onProgress?.({
             phase: "ocr",
             current: processed,
             total: toIndex.length,
-            currentFile: basename(imagePath),
+            totalFound: imagePaths.length,
+            alreadyIndexed: alreadyIndexedCount,
+            currentFile: fileName,
+            workerCount,
+            activeCount: activeWorkers.size,
+            indexed,
+            skipped: skippedNoText + alreadyIndexedCount,
+            failed,
           });
-          return null;
+          return;
         }
 
-        // First try OCR (fast)
-        const ocrResult = await processImage(imagePath);
-
-        processed++;
-        options.onProgress?.({
-          phase: "ocr",
-          current: processed,
-          total: toIndex.length,
-          currentFile: basename(imagePath),
-        });
+        // Process with OCR
+        const ocrResult = await processImage(item.path);
 
         let text = ocrResult.text;
         let tags: string[] = [];
         let method = "ocr";
 
-        // Only run vision if OCR didn't find meaningful text
-        // This is much faster - vision only runs on photos, not text-heavy screenshots
-        // Filter out garbage OCR (repeated characters, symbols, etc.)
-        const cleanText = ocrResult.text.replace(/[—–\-_=|·•◦○●▪▫■□►▶◀◄~`'".,;:!?@#$%^&*()[\]{}\\/<>]/g, '').trim();
-        const wordCount = cleanText.split(/\s+/).filter(w => w.length > 2).length;
+        // Clean text to evaluate if OCR extracted meaningful content
+        const cleanText = ocrResult.text
+          .replace(/[—–\-_=|·•◦○●▪▫■□►▶◀◄~`'".,;:!?@#$%^&*()[\]{}\\/<>]/g, "")
+          .trim();
+        const wordCount = cleanText.split(/\s+/).filter((w) => w.length > 2).length;
         const hasGoodText = ocrResult.hasContent && ocrResult.confidence > 40 && wordCount > 10;
 
+        // If OCR didn't yield meaningful text, try vision captioning if available
         if (!hasGoodText && visionAvailable) {
           try {
-            const visionResult = await describeImage(imagePath);
+            const visionResult = await describeImage(item.path);
             if (visionResult) {
               tags = visionResult.tags;
               text = text
@@ -210,99 +279,118 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
               method = ocrResult.hasContent ? "both" : "caption";
             }
           } catch (err) {
-            logger.debug(`Vision failed for ${basename(imagePath)}: ${err}`);
+            logger.debug(`Vision failed for ${fileName}: ${err}`);
           }
         }
 
-        // Skip if no content at all
+        // If no content extracted from either OCR or vision, skip
         if (!text.trim()) {
-          skipped++;
-          return null;
+          skippedNoText++;
+          processed++;
+          catalog.record(item.path, item.stat, "empty");
+          activeWorkers.delete(slotId);
+          options.onProgress?.({
+            phase: "ocr",
+            current: processed,
+            total: toIndex.length,
+            totalFound: imagePaths.length,
+            alreadyIndexed: alreadyIndexedCount,
+            currentFile: fileName,
+            workerCount,
+            activeCount: activeWorkers.size,
+            indexed,
+            skipped: skippedNoText + alreadyIndexedCount,
+            failed,
+          });
+          return;
         }
 
-        // Get file stats
-        const stats = statSync(imagePath);
+        // Success: queue document
+        indexed++;
+        processed++;
+        catalog.record(item.path, item.stat, "indexed");
 
-        return {
+        pendingDocs.push({
           text,
-          title: basename(imagePath),
-          label: DOCUMENT_LABEL,
+          title: fileName,
+          uri: item.path,
+          labels: [DOCUMENT_LABEL],
           tags,
           metadata: {
-            path: imagePath,
-            timestamp: stats.mtime.getTime(),
-            fileSize: stats.size,
+            path: item.path,
+            timestamp: item.stat.mtimeMs,
+            fileSize: item.stat.size,
             width: ocrResult.metadata.width,
             height: ocrResult.metadata.height,
             confidence: ocrResult.confidence,
             method,
           },
-        };
-      } catch (err) {
-        failed++;
-        processed++;
-        const error = err instanceof Error ? err : new Error(String(err));
-        options.onFileError?.(imagePath, error);
+        });
+
+        // If buffer reached BATCH_INSERT_SIZE, flush to Memvid and save catalog
+        if (pendingDocs.length >= BATCH_INSERT_SIZE) {
+          await flushPendingDocs();
+        }
+
+        activeWorkers.delete(slotId);
         options.onProgress?.({
           phase: "ocr",
           current: processed,
           total: toIndex.length,
-          currentFile: basename(imagePath),
+          totalFound: imagePaths.length,
+          alreadyIndexed: alreadyIndexedCount,
+          currentFile: fileName,
+          workerCount,
+          activeCount: activeWorkers.size,
+          indexed,
+          skipped: skippedNoText + alreadyIndexedCount,
+          failed,
         });
-        return null;
+      } catch (err) {
+        failed++;
+        processed++;
+        catalog.record(item.path, item.stat, "failed");
+        activeWorkers.delete(slotId);
+        const error = err instanceof Error ? err : new Error(String(err));
+        options.onFileError?.(item.path, error);
+        options.onProgress?.({
+          phase: "ocr",
+          current: processed,
+          total: toIndex.length,
+          totalFound: imagePaths.length,
+          alreadyIndexed: alreadyIndexedCount,
+          currentFile: fileName,
+          workerCount,
+          activeCount: activeWorkers.size,
+          indexed,
+          skipped: skippedNoText + alreadyIndexedCount,
+          failed,
+        });
       }
-    });
+    })
+  );
 
-    const batchResults = await Promise.all(batchPromises);
+  await Promise.all(tasks);
 
-    // Add successful results to documents
-    for (const doc of batchResults) {
-      if (doc) {
-        documents.push(doc);
-      }
-    }
+  // Flush remaining queued documents
+  while (pendingDocs.length > 0) {
+    await flushPendingDocs();
   }
 
-  // Shutdown OCR and Vision
+  if (flushError) {
+    throw new IndexError(`Failed to store documents: ${flushError.message}`);
+  }
+
+  // Save final catalog
+  try {
+    catalog.save();
+  } catch (err) {
+    logger.debug(`Could not save catalog: ${err}`);
+  }
+
+  // Shutdown OCR and Vision engines
   await shutdownOcr();
   await shutdownVision();
-
-  // Index documents into memvid
-  options.onProgress?.({
-    phase: "indexing",
-    current: 0,
-    total: documents.length,
-    message: "Storing documents in memory...",
-  });
-
-  if (documents.length > 0) {
-    try {
-      // Insert in batches
-      for (let i = 0; i < documents.length; i += BATCH_INSERT_SIZE) {
-        const batch = documents.slice(i, i + BATCH_INSERT_SIZE);
-
-        await putDocuments(
-          mv,
-          batch.map((doc) => ({
-            title: doc.title,
-            text: doc.text,
-            labels: [doc.label],
-            tags: doc.tags,
-            metadata: doc.metadata,
-          }))
-        );
-
-        options.onProgress?.({
-          phase: "indexing",
-          current: Math.min(i + BATCH_INSERT_SIZE, documents.length),
-          total: documents.length,
-        });
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new IndexError(`Failed to store documents: ${message}`);
-    }
-  }
 
   // Finalize index
   options.onProgress?.({
@@ -314,8 +402,6 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
 
   try {
     await mv.seal();
-    // Note: rebuildTimeIndex might not be available in all SDK versions
-    // await mv.rebuildTimeIndex();
   } catch (err) {
     logger.debug(`Finalization warning: ${err}`);
   }
@@ -332,8 +418,9 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
 
   return {
     totalFound: imagePaths.length,
-    indexed: documents.length,
-    skipped,
+    alreadyIndexed: alreadyIndexedCount,
+    indexed,
+    skipped: skippedNoText + alreadyIndexedCount,
     failed,
     timeMs: Date.now() - startTime,
     memoryPath: config.memoryPath,
@@ -354,6 +441,7 @@ export async function indexSingleImage(
   }
 ): Promise<{ success: boolean; method: "ocr" | "caption" | "both" | "none" }> {
   const resolved = resolvePath(imagePath);
+  const config = getConfig();
 
   if (!existsSync(resolved)) {
     throw new DirectoryNotFoundError(resolved);
@@ -375,10 +463,10 @@ export async function indexSingleImage(
 
   try {
     // Smart strategy: Try vision first (faster for photos), then OCR if needed
-    const visionReady = options?.caption !== false && await isVisionAvailable();
+    const visionReady = options?.caption !== false && (await isVisionAvailable());
 
     if (visionReady) {
-      // Step 1: Try vision captioning first (fast: ~300ms)
+      // Step 1: Try vision captioning first
       options?.onProgress?.("caption", "Analyzing image...");
       const visionResult = await describeImage(resolved);
 
@@ -389,8 +477,7 @@ export async function indexSingleImage(
       }
     }
 
-    // Step 2: Only run OCR if we don't have a good caption (OCR is slow ~2-3s)
-    // For photos, caption is enough. For screenshots, we need OCR.
+    // Step 2: Only run OCR if we don't have a good caption
     const needsOcr = !captionText || options?.caption === false;
 
     if (needsOcr) {
@@ -427,8 +514,17 @@ export async function indexSingleImage(
       .filter(Boolean)
       .join("\n\n");
 
+    // Get file stats
+    const stats = statSync(resolved);
+
     // Skip if no content at all
     if (!combinedText.trim()) {
+      try {
+        const catalog = await loadCatalog(config.memoryPath);
+        catalog.record(resolved, { mtimeMs: stats.mtime.getTime(), size: stats.size }, "empty");
+        catalog.save();
+      } catch {}
+
       if (options?.shutdownOcrAfter) {
         await shutdownOcr();
         await shutdownVision();
@@ -436,30 +532,39 @@ export async function indexSingleImage(
       return { success: false, method: "none" };
     }
 
-    // Get file stats
-    const stats = statSync(resolved);
-
     // Get memory (create if needed)
     const mv = await getMemory({ create: true });
 
     // Add to index
     options?.onProgress?.("indexing", "Storing...");
-    await putDocuments(mv, [{
-      text: combinedText,
-      title: basename(resolved),
-      labels: [DOCUMENT_LABEL],
-      tags: captionTags,
-      metadata: {
-        path: resolved,
-        timestamp: stats.mtime.getTime(),
-        fileSize: stats.size,
-        width: imageWidth,
-        height: imageHeight,
-        confidence: ocrConfidence,
-        hasCaption: !!captionText,
-        method,
+    await putDocuments(mv, [
+      {
+        text: combinedText,
+        title: basename(resolved),
+        uri: resolved,
+        labels: [DOCUMENT_LABEL],
+        tags: captionTags,
+        metadata: {
+          path: resolved,
+          timestamp: stats.mtime.getTime(),
+          fileSize: stats.size,
+          width: imageWidth,
+          height: imageHeight,
+          confidence: ocrConfidence,
+          hasCaption: !!captionText,
+          method,
+        },
       },
-    }]);
+    ]);
+
+    // Record in catalog
+    try {
+      const catalog = await loadCatalog(config.memoryPath);
+      catalog.record(resolved, { mtimeMs: stats.mtime.getTime(), size: stats.size }, "indexed");
+      catalog.save();
+    } catch (catErr) {
+      logger.debug(`Could not update catalog: ${catErr}`);
+    }
 
     // Shutdown if requested
     if (options?.shutdownOcrAfter) {

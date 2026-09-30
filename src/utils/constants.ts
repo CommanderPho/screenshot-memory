@@ -53,7 +53,7 @@ export const DEFAULT_CONFIG = {
 // Memory file settings
 export const MEMORY_FILE_NAME = "screenshots.mv2";
 
-// Performance limits
+export const MIN_IMAGE_DIMENSION = 10; // Minimum width/height for viable OCR
 export const MAX_IMAGE_DIMENSION = 3000; // Max width/height for OCR
 export const MIN_TEXT_LENGTH = 3; // Minimum OCR text length to index
 export const MAX_CONCURRENT_OCR = 8; // Maximum parallel OCR workers
