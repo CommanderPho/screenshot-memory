@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { coreMlEmbeddingFailure, nativeEmbeddingsUnavailable } from "./ollama.js";
+import {
+  coreMlEmbeddingFailure,
+  memvidEmbeddingModel,
+  nativeEmbeddingsUnavailable,
+  shouldRetrySmallerNativeBatch,
+} from "./ollama.js";
 
 const COREML_ERROR =
   "Embedding failed: failed to compute embeddings with fastembed: Non-zero status code returned while running CoreMLExecutionProvider node. " +
@@ -34,5 +39,45 @@ describe("nativeEmbeddingsUnavailable", () => {
 
   test("accepts a string error", () => {
     expect(nativeEmbeddingsUnavailable("not available on this platform")).toBe(true);
+  });
+});
+
+describe("shouldRetrySmallerNativeBatch", () => {
+  test("retries a CoreML failure when the batch has more than one document", () => {
+    expect(shouldRetrySmallerNativeBatch(new Error(COREML_ERROR), 50)).toBe(true);
+  });
+
+  test("does not split a single document", () => {
+    expect(shouldRetrySmallerNativeBatch(new Error(COREML_ERROR), 1)).toBe(false);
+  });
+
+  test("does not split an unrelated error", () => {
+    expect(shouldRetrySmallerNativeBatch(new Error("disk full"), 50)).toBe(false);
+  });
+
+  test("does not split when the native model is missing on this platform", () => {
+    expect(
+      shouldRetrySmallerNativeBatch(new Error("not available on this platform"), 50)
+    ).toBe(false);
+  });
+});
+
+describe("memvidEmbeddingModel", () => {
+  test("maps the Ollama nomic id to the memvid alias", () => {
+    expect(memvidEmbeddingModel("nomic-embed-text")).toBe("nomic");
+    expect(memvidEmbeddingModel("  Nomic-Embed-Text  ")).toBe("nomic");
+  });
+
+  test("drops an Ollama tag suffix before mapping", () => {
+    expect(memvidEmbeddingModel("nomic-embed-text:latest")).toBe("nomic");
+  });
+
+  test("passes short aliases through", () => {
+    expect(memvidEmbeddingModel("nomic")).toBe("nomic");
+    expect(memvidEmbeddingModel("bge-small")).toBe("bge-small");
+  });
+
+  test("leaves unknown names unchanged", () => {
+    expect(memvidEmbeddingModel("custom-embedder")).toBe("custom-embedder");
   });
 });
