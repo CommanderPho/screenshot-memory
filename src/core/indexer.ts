@@ -63,6 +63,8 @@ export interface IndexProgress {
   indexed?: number;
   skipped?: number;
   failed?: number;
+  /** Files whose completion should drive items/sec. Omits stored-text reuse. */
+  throughput?: number;
   message?: string;
 }
 
@@ -280,6 +282,7 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
     totalFound: imagePaths.length,
     alreadyIndexed: alreadyIndexedCount,
     workerCount,
+    throughput: 0,
     message: `Initializing OCR engine (${workerCount} workers)...`,
   });
 
@@ -300,6 +303,7 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
   let indexed = 0;
   let skippedNoText = 0;
   let failed = 0;
+  let throughput = 0;
 
   // Queued documents are not catalogued until the batch transaction commits.
   const pendingDocs: Array<{
@@ -400,6 +404,7 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
               indexed,
               skipped: skippedNoText + alreadyIndexedCount + preflightRejected,
               failed,
+              throughput,
             });
             return;
           }
@@ -410,6 +415,7 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
         if (!valid) {
           skippedNoText++;
           processed++;
+          throughput++;
           catalog.record(item.path, item.stat, "empty");
           activeWorkers.delete(slotId);
           options.onProgress?.({
@@ -424,6 +430,7 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
             indexed,
             skipped: skippedNoText + alreadyIndexedCount + preflightRejected,
             failed,
+            throughput,
           });
           return;
         }
@@ -462,6 +469,7 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
         if (!text.trim()) {
           skippedNoText++;
           processed++;
+          throughput++;
           catalog.record(item.path, item.stat, "empty");
           activeWorkers.delete(slotId);
           options.onProgress?.({
@@ -476,6 +484,7 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
             indexed,
             skipped: skippedNoText + alreadyIndexedCount + preflightRejected,
             failed,
+            throughput,
           });
           return;
         }
@@ -483,6 +492,7 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
         // Success: queue document. The catalog entry is written after the batch commits.
         indexed++;
         processed++;
+        throughput++;
 
         if (backup) {
           backup.upsert({
@@ -534,11 +544,13 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
           indexed,
           skipped: skippedNoText + alreadyIndexedCount + preflightRejected,
           failed,
+          throughput,
         });
       } catch (err) {
         if (storageError) throw storageError;
         failed++;
         processed++;
+        throughput++;
         catalog.record(item.path, item.stat, "failed");
         activeWorkers.delete(slotId);
         const error = err instanceof Error ? err : new Error(String(err));
@@ -555,6 +567,7 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
           indexed,
           skipped: skippedNoText + alreadyIndexedCount + preflightRejected,
           failed,
+          throughput,
         });
       }
     })

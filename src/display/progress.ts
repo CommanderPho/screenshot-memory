@@ -15,6 +15,45 @@ export interface ProgressBarOptions {
   showSpeed?: boolean;
 }
 
+export interface IndexingRateInput {
+  value: number;
+  total: number;
+  elapsedMs: number;
+  /** When set, items/sec and ETA use this count instead of `value`. */
+  throughput?: number;
+}
+
+export interface IndexingRate {
+  rate: number;
+  rateLabel: string;
+  etaLabel: string;
+}
+
+/**
+ * Items/sec and ETA for the indexing bar.
+ * `value` is still the displayed count. `throughput` is the subset that should set the speed.
+ */
+export function indexingRate(input: IndexingRateInput): IndexingRate {
+  const hasThroughput = typeof input.throughput === "number";
+  const counted = hasThroughput ? input.throughput ?? 0 : input.value;
+  const elapsedMs = Math.max(0, input.elapsedMs);
+  const rate = counted > 0 && elapsedMs > 0 ? counted / (elapsedMs / 1000) : 0;
+  const remaining = Math.max(0, input.total - input.value);
+  const rateLabel = rate > 0 ? `${rate >= 10 ? Math.round(rate) : rate.toFixed(1)}/s` : "--/s";
+
+  let etaLabel: string;
+  if (remaining === 0) {
+    etaLabel = "0s";
+  } else if (hasThroughput && counted === 0) {
+    etaLabel = "--";
+  } else {
+    const etaMs = rate > 0 ? (remaining / rate) * 1000 : 0;
+    etaLabel = formatDuration(etaMs);
+  }
+
+  return { rate, rateLabel, etaLabel };
+}
+
 /**
  * Create a progress bar for indexing with elapsed time, ETA, rate, and live file tracking
  */
@@ -41,12 +80,13 @@ export function createIndexingProgressBar(_options: ProgressBarOptions): cliProg
         const elapsedMs = Math.max(0, Date.now() - params.startTime);
         const elapsedStr = formatDuration(elapsedMs);
 
-        // Rate & ETA
-        const rate = params.value > 0 && elapsedMs > 0 ? params.value / (elapsedMs / 1000) : 0;
-        const remaining = Math.max(0, params.total - params.value);
-        const etaMs = rate > 0 ? (remaining / rate) * 1000 : 0;
-        const etaStr = remaining === 0 ? "0s" : formatDuration(etaMs);
-        const rateStr = rate > 0 ? `${rate >= 10 ? Math.round(rate) : rate.toFixed(1)}/s` : "--/s";
+        // Rate & ETA. Stored-text reuse stays in the fraction, not in items/sec.
+        const { rateLabel: rateStr, etaLabel: etaStr } = indexingRate({
+          value: params.value,
+          total: params.total,
+          elapsedMs,
+          throughput: typeof payload?.throughput === "number" ? payload.throughput : undefined,
+        });
 
         // Worker & File status
         let fileInfo = "";

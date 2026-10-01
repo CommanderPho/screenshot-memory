@@ -189,6 +189,7 @@ export async function indexCommand(
             indexed: p.indexed,
             skipped: p.skipped,
             failed: p.failed,
+            ...(p.throughput !== undefined ? { throughput: p.throughput } : {}),
           });
         }
       },
