@@ -7,14 +7,9 @@
 
 // Core functionality
 export {
-  // Memory
-  getMemory,
-  createMemory,
-  closeMemory,
   memoryExists,
   getMemoryStats,
   getMemoryPath,
-  type Memvid,
 } from "./core/memory.js";
 
 export {

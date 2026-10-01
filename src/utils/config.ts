@@ -29,7 +29,7 @@ export interface IndexingConfig {
   batchSize: number;
   compressionLevel: number;
   embeddingModel: string;
-  /** Write OCR text to a local SQLite file as well as memvid. */
+  /** Keep OCR text in the local SQLite search index. */
   ocrBackup: boolean;
 }
 

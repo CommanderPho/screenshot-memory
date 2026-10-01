@@ -4,9 +4,9 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { ensureDir, logger, resolvePath } from "../utils/index.js";
+import { ensureDir, resolvePath } from "../utils/index.js";
 
 interface SqlStatement {
   get(...params: unknown[]): Record<string, unknown> | null | undefined;
@@ -14,10 +14,11 @@ interface SqlStatement {
   run(...params: unknown[]): unknown;
 }
 
-interface SqlDatabase {
+export interface SqlDatabase {
   exec(sql: string): void;
   prepare(sql: string): SqlStatement;
   close(): void;
+  loadExtension(file: string): void;
 }
 
 export interface OcrBackupWrite {
@@ -29,6 +30,9 @@ export interface OcrBackupWrite {
   size: number;
   confidence?: number | null;
   method?: string | null;
+  tags?: string[] | null;
+  width?: number | null;
+  height?: number | null;
 }
 
 export interface OcrBackupRecord {
@@ -57,12 +61,23 @@ CREATE TABLE IF NOT EXISTS ocr_text (
   size INTEGER NOT NULL,
   confidence REAL,
   method TEXT,
-  updated_at INTEGER NOT NULL
+  updated_at INTEGER NOT NULL,
+  tags TEXT,
+  width INTEGER,
+  height INTEGER,
+  embedded_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_ocr_text_content_hash ON ocr_text(content_hash);
 `;
 
-/** SQLite file next to the memvid file: screenshots.mv2 -> screenshots.ocr.sqlite */
+const EXTRA_COLUMNS: Array<[string, string]> = [
+  ["tags", "TEXT"],
+  ["width", "INTEGER"],
+  ["height", "INTEGER"],
+  ["embedded_at", "INTEGER"],
+];
+
+/** SQLite index next to the configured memory path: screenshots.mv2 -> screenshots.ocr.sqlite */
 export function ocrBackupPath(memoryPath: string): string {
   const resolved = resolvePath(memoryPath);
   const stem = basename(resolved).replace(/\.mv2$/i, "");
@@ -77,7 +92,7 @@ export function hashImageFile(filePath: string): string {
   return hashImageBytes(readFileSync(filePath));
 }
 
-async function openSql(filePath: string): Promise<SqlDatabase> {
+export async function openSqlDatabase(filePath: string): Promise<SqlDatabase> {
   if (process.versions.bun) {
     const bunSqlite = await import("bun:sqlite");
     const db = new bunSqlite.Database(filePath);
@@ -85,6 +100,7 @@ async function openSql(filePath: string): Promise<SqlDatabase> {
       exec: (sql) => db.exec(sql),
       prepare: (sql) => db.query(sql),
       close: () => db.close(),
+      loadExtension: (file) => loadSqliteExtension(db, file),
     };
   }
 
@@ -94,7 +110,28 @@ async function openSql(filePath: string): Promise<SqlDatabase> {
     exec: (sql) => db.exec(sql),
     prepare: (sql) => db.prepare(sql),
     close: () => db.close(),
+    loadExtension: (file) => loadSqliteExtension(db, file),
   };
+}
+
+function loadSqliteExtension(db: object, file: string): void {
+  const loader = db as { loadExtension?: (path: string) => void };
+  if (!loader.loadExtension) {
+    throw new Error("This SQLite build cannot load extensions.");
+  }
+  loader.loadExtension(file);
+}
+
+export function ensureOcrSchema(db: SqlDatabase): void {
+  db.exec(SCHEMA);
+  const existing = new Set(
+    db.prepare("PRAGMA table_info(ocr_text)").all().map((row) => asString(row.name) ?? "")
+  );
+  for (const [name, type] of EXTRA_COLUMNS) {
+    if (!existing.has(name)) {
+      db.exec(`ALTER TABLE ocr_text ADD COLUMN ${name} ${type}`);
+    }
+  }
 }
 
 function asString(value: unknown): string | null {
@@ -120,16 +157,21 @@ function rowToRecord(row: Record<string, unknown>): OcrBackupRecord {
 }
 
 export class OcrBackup {
-  private constructor(private readonly db: SqlDatabase) {}
+  private constructor(readonly db: SqlDatabase) {}
+
+  /** Use a connection that already has the OCR schema. */
+  static bind(db: SqlDatabase): OcrBackup {
+    ensureOcrSchema(db);
+    return new OcrBackup(db);
+  }
 
   static async open(memoryPath: string): Promise<OcrBackup> {
     const filePath = ocrBackupPath(memoryPath);
     ensureDir(dirname(filePath));
-    const db = await openSql(filePath);
+    const db = await openSqlDatabase(filePath);
     db.exec("PRAGMA journal_mode = WAL");
     db.exec("PRAGMA busy_timeout = 5000");
-    db.exec(SCHEMA);
-    return new OcrBackup(db);
+    return OcrBackup.bind(db);
   }
 
   close(): void {
@@ -144,8 +186,9 @@ export class OcrBackup {
     const path = resolvePath(write.path);
     this.db.prepare(
       `INSERT INTO ocr_text (
-         path, content_hash, text, title, mtime_ms, size, confidence, method, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         path, content_hash, text, title, mtime_ms, size, confidence, method, updated_at,
+         tags, width, height
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(path) DO UPDATE SET
          content_hash = excluded.content_hash,
          text = excluded.text,
@@ -154,7 +197,11 @@ export class OcrBackup {
          size = excluded.size,
          confidence = excluded.confidence,
          method = excluded.method,
-         updated_at = excluded.updated_at`
+         updated_at = excluded.updated_at,
+         tags = excluded.tags,
+         width = excluded.width,
+         height = excluded.height,
+         embedded_at = NULL`
     ).run(
       path,
       write.contentHash,
@@ -164,7 +211,10 @@ export class OcrBackup {
       write.size,
       write.confidence ?? null,
       write.method ?? null,
-      Date.now()
+      Date.now(),
+      write.tags && write.tags.length > 0 ? JSON.stringify(write.tags) : null,
+      write.width ?? null,
+      write.height ?? null
     );
   }
 
@@ -224,78 +274,11 @@ export class OcrBackup {
 
     return match;
   }
-}
 
-interface MemoryTextSource {
-  timeline(): Promise<Array<{ frame_id: number; uri?: string; preview?: string }>>;
-  view(frameId: number): Promise<string>;
-}
-
-/**
- * Copy frames already stored in memvid into SQLite when that path is missing.
- * Hashes the image when the file is still on disk.
- */
-export async function backfillOcrBackup(backup: OcrBackup, source: MemoryTextSource): Promise<number> {
-  const timeline = await source.timeline();
-  let inserted = 0;
-
-  for (const entry of timeline) {
-    if (!entry.uri) continue;
-    const path = resolvePath(entry.uri);
-    if (backup.findByPath(path)) continue;
-
-    let text = "";
-    try {
-      text = await source.view(entry.frame_id);
-    } catch (err) {
-      logger.debug(`Could not read memvid frame ${entry.frame_id}: ${err}`);
-      text = entry.preview ?? "";
-    }
-    if (!text.trim()) continue;
-
-    let contentHash: string | null = null;
-    let mtimeMs = 0;
-    let size = 0;
-    if (existsSync(path)) {
-      try {
-        const fileStat = statSync(path);
-        contentHash = hashImageFile(path);
-        mtimeMs = fileStat.mtime.getTime();
-        size = fileStat.size;
-      } catch (err) {
-        logger.debug(`Could not hash ${path} during OCR backup backfill: ${err}`);
-      }
-    }
-
-    backup.upsert({
-      path,
-      contentHash,
-      text,
-      title: basename(path),
-      mtimeMs,
-      size,
-      method: "ocr",
-    });
-    inserted++;
-  }
-
-  logger.debug(`OCR backup backfill stored ${inserted} documents`);
-  return inserted;
-}
-
-/** Read an existing `.mv2` once, then drop the handle before a later create. */
-export async function backfillOcrBackupFile(backup: OcrBackup, memoryPath: string): Promise<number> {
-  const resolvedMemory = resolvePath(memoryPath);
-  if (!existsSync(resolvedMemory)) return 0;
-
-  const { open } = await import("@memvid/sdk");
-  const mv = await open(resolvedMemory, "basic", { readOnly: true });
-  try {
-    return await backfillOcrBackup(backup, mv);
-  } finally {
-    const core = (mv as unknown as { core?: { close?: () => void } }).core;
-    if (typeof core?.close === "function") {
-      core.close();
-    }
+  isEmbedded(filePath: string): boolean {
+    const row = this.db.prepare(
+      "SELECT embedded_at FROM ocr_text WHERE path = ?"
+    ).get(resolvePath(filePath));
+    return asNumber(row?.embedded_at) !== null;
   }
 }

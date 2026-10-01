@@ -101,9 +101,9 @@ export class MemoryNotInitializedError extends ScreenshotMemoryError {
 export class CapacityExceededError extends ScreenshotMemoryError {
   constructor() {
     super(
-      "Memory capacity exceeded.",
+      "The search index could not store more documents.",
       "CAPACITY_EXCEEDED",
-      "Contact support or upgrade your plan."
+      "Check that the disk has free space, then run the index again."
     );
     this.name = "CapacityExceededError";
   }
@@ -121,15 +121,7 @@ export function formatError(err: unknown): { message: string; suggestion?: strin
   }
 
   if (err instanceof Error) {
-    // Handle known memvid errors
-    if (err.message.includes("MV001") || err.message.includes("Capacity")) {
-      return {
-        message: "Memory capacity exceeded.",
-        suggestion: "Contact support or upgrade your plan.",
-      };
-    }
-
-    if (err.message.includes("MV007") || err.message.includes("locked")) {
+    if (err.message.includes("locked")) {
       return {
         message: "Memory file is locked by another process.",
         suggestion: "Close other instances of screenshot-memory or wait and try again.",

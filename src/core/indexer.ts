@@ -1,23 +1,23 @@
 /**
  * Indexer module for screenshot-memory
- * Handles batch and incremental indexing of screenshots into memvid
+ * Handles batch and incremental indexing of screenshots into the local SQLite index
  */
 
 import { statSync, existsSync } from "node:fs";
 import { basename } from "node:path";
 import pLimit from "p-limit";
-import { getMemory, createMemory, memoryExists, getMemoryStats } from "./memory.js";
+import { getMemoryStats, memoryExists } from "./memory.js";
 import { loadCatalog, clearCatalog } from "./catalog.js";
 import { classifyImages, compareImageRecords, findScreenshotPaths, type ImageSort } from "./preflight.js";
 import { initializeOcr, processImage, shutdownOcr, isValidImage, resetOcrWarningDedupe, setOcrWarningHandler } from "../ocr/index.js";
 import { describeImage, shutdownVision, isVisionAvailable } from "../vision/index.js";
-import { putDocuments } from "../embeddings/ollama.js";
-import { OcrBackup, backfillOcrBackup, backfillOcrBackupFile, hashImageFile } from "./ocr-backup.js";
+import { getLocalEmbedder } from "../embeddings/ollama.js";
+import { hashImageFile, ocrBackupPath } from "./ocr-backup.js";
+import { SearchStore, type VectorBatchItem } from "./search-store.js";
 import {
   getConfig,
   logger,
   resolvePath,
-  DOCUMENT_LABEL,
   BATCH_INSERT_SIZE,
   DirectoryNotFoundError,
   NoScreenshotsFoundError,
@@ -105,7 +105,8 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
 async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
   const startTime = Date.now();
   const config = getConfig();
-  let backup: OcrBackup | null = null;
+  const indexPath = ocrBackupPath(config.memoryPath);
+  let store: SearchStore | null = null;
 
   try {
   options.onProgress?.({
@@ -138,34 +139,13 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
   // Load catalog
   const catalog = await loadCatalog(config.memoryPath);
 
-  if (config.indexing.ocrBackup) {
-    backup = await OcrBackup.open(config.memoryPath);
-    if (options.force && memoryExists()) {
-      try {
-        await backfillOcrBackupFile(backup, config.memoryPath);
-      } catch (err) {
-        logger.debug(`OCR backup backfill failed: ${err}`);
-      }
-    }
-  }
+  store = await SearchStore.open(config.memoryPath);
+  const backup = store.texts;
 
   if (options.force) {
     catalog.clear();
     clearCatalog(config.memoryPath);
-  }
-
-  // Get or create memory
-  const isNewIndex = !memoryExists() || options.force;
-  const mv = isNewIndex
-    ? await createMemory()
-    : await getMemory({ create: true });
-
-  if (backup && !isNewIndex) {
-    try {
-      await backfillOcrBackup(backup, mv);
-    } catch (err) {
-      logger.debug(`OCR backup backfill failed: ${err}`);
-    }
+    store.clearVectors();
   }
 
   // Partition images: already indexed vs to-index
@@ -177,7 +157,7 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
     try {
       const stats = statSync(p);
       const fileStat = { mtimeMs: stats.mtime.getTime(), size: stats.size };
-      if (!options.force && catalog.isUpToDate(p, fileStat)) {
+      if (!options.force && catalog.isUpToDate(p, fileStat) && store.isEmbedded(p)) {
         alreadyIndexedCount++;
       } else {
         toIndex.push({ path: p, stat: fileStat });
@@ -196,7 +176,7 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
       message: "All screenshots are already indexed.",
     });
 
-    const finalStats = await getMemoryStats();
+    const finalStats = store.stats();
     return {
       totalFound: imagePaths.length,
       alreadyIndexed: alreadyIndexedCount,
@@ -205,8 +185,8 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
       preflightRejected,
       failed: 0,
       timeMs: Date.now() - startTime,
-      memoryPath: config.memoryPath,
-      indexSizeBytes: finalStats.usedBytes,
+      memoryPath: indexPath,
+      indexSizeBytes: finalStats.indexSizeBytes,
     };
   }
 
@@ -275,7 +255,7 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
       message: "No screenshots left to process.",
     });
 
-    const finalStats = await getMemoryStats();
+    const finalStats = store.stats();
     return {
       totalFound: imagePaths.length,
       alreadyIndexed: alreadyIndexedCount,
@@ -284,8 +264,8 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
       skipped: alreadyIndexedCount + preflightRejected,
       failed: 0,
       timeMs: Date.now() - startTime,
-      memoryPath: config.memoryPath,
-      indexSizeBytes: finalStats.usedBytes,
+      memoryPath: indexPath,
+      indexSizeBytes: finalStats.indexSizeBytes,
     };
   }
 
@@ -321,15 +301,13 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
   let skippedNoText = 0;
   let failed = 0;
 
-  // Queued documents are not catalogued until put + seal succeed.
+  // Queued documents are not catalogued until the batch transaction commits.
   const pendingDocs: Array<{
     path: string;
     stat: { mtimeMs: number; size: number };
     doc: {
       title: string;
       text: string;
-      uri: string;
-      labels: string[];
       tags: string[];
       metadata: Record<string, unknown>;
     };
@@ -347,10 +325,23 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
     isFlushing = true;
     const chunk = pendingDocs.splice(0, pendingDocs.length);
     try {
-      await putDocuments(mv, chunk.map((item) => item.doc));
-      // Commit before the skip list. A crash must not mark files indexed that
-      // a new process cannot see, and seal() leaves this handle writable.
-      await mv.seal();
+      const embeddings = await getLocalEmbedder().embedDocuments(chunk.map((item) => item.doc.text));
+      if (embeddings.length !== chunk.length) {
+        throw new Error(`Expected ${chunk.length} embeddings, got ${embeddings.length}.`);
+      }
+      const batch: VectorBatchItem[] = chunk.map((item, index) => ({
+        path: item.path,
+        embedding: embeddings[index] ?? [],
+        tags: item.doc.tags,
+        width: asMetaNumber(item.doc.metadata.width),
+        height: asMetaNumber(item.doc.metadata.height),
+      }));
+      // Commit the vectors before the skip list. A crash must not mark files
+      // indexed that a new process cannot see.
+      if (!store) {
+        throw new IndexError("Search index is not open.");
+      }
+      store.insertBatch(batch);
       for (const item of chunk) {
         catalog.record(item.path, item.stat, "indexed");
       }
@@ -383,8 +374,6 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
               doc: {
                 text: known.text,
                 title: fileName,
-                uri: item.path,
-                labels: [DOCUMENT_LABEL],
                 tags: [],
                 metadata: {
                   path: item.path,
@@ -514,8 +503,6 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
           doc: {
             text,
             title: fileName,
-            uri: item.path,
-            labels: [DOCUMENT_LABEL],
             tags,
             metadata: {
               path: item.path,
@@ -529,7 +516,7 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
           },
         });
 
-        // If buffer reached BATCH_INSERT_SIZE, flush to Memvid and save catalog
+        // If buffer reached BATCH_INSERT_SIZE, embed it and save the catalog
         if (pendingDocs.length >= BATCH_INSERT_SIZE) {
           await flushPendingDocs();
         }
@@ -605,22 +592,6 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
   const stopped = options.signal?.aborted === true;
 
   if (!stopped) {
-    // Finalize index
-    options.onProgress?.({
-      phase: "finalizing",
-      current: 0,
-      total: 1,
-      message: "Optimizing index...",
-    });
-  }
-
-  try {
-    await mv.seal();
-  } catch (err) {
-    logger.debug(`Finalization warning: ${err}`);
-  }
-
-  if (!stopped) {
     options.onProgress?.({
       phase: "finalizing",
       current: 1,
@@ -629,8 +600,7 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
     });
   }
 
-  // Get final stats
-  const finalStats = await getMemoryStats();
+  const finalStats = store.stats();
 
   return {
     totalFound: imagePaths.length,
@@ -641,11 +611,11 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
     failed,
     stopped,
     timeMs: Date.now() - startTime,
-    memoryPath: config.memoryPath,
-    indexSizeBytes: finalStats.usedBytes,
+    memoryPath: indexPath,
+    indexSizeBytes: finalStats.indexSizeBytes,
   };
   } finally {
-    backup?.close();
+    store?.close();
   }
 }
 
@@ -681,53 +651,40 @@ export async function indexSingleImage(
   let method: "ocr" | "caption" | "both" | "none" = "none";
   let imageWidth = 0;
   let imageHeight = 0;
-  let backup: OcrBackup | null = null;
+  let store: SearchStore | null = null;
 
   try {
-    if (config.indexing.ocrBackup) {
-      backup = await OcrBackup.open(config.memoryPath);
-      const fileStat = statSync(resolved);
-      const catalog = await loadCatalog(config.memoryPath);
-      if (!catalog.get(resolved)) {
-        const known = backup.rememberMovedFile(resolved, {
-          mtimeMs: fileStat.mtime.getTime(),
-          size: fileStat.size,
-        });
-        if (known) {
-          const mv = await getMemory({ create: true });
-          options?.onProgress?.("indexing", "Storing...");
-          await putDocuments(mv, [
-            {
-              text: known.text,
-              title: basename(resolved),
-              uri: resolved,
-              labels: [DOCUMENT_LABEL],
-              tags: [],
-              metadata: {
-                path: resolved,
-                timestamp: fileStat.mtime.getTime(),
-                fileSize: fileStat.size,
-                confidence: known.confidence ?? 0,
-                method: known.method ?? "ocr",
-              },
-            },
-          ]);
-          try {
-            catalog.record(
-              resolved,
-              { mtimeMs: fileStat.mtime.getTime(), size: fileStat.size },
-              "indexed"
-            );
-            catalog.save();
-          } catch (catErr) {
-            logger.debug(`Could not update catalog: ${catErr}`);
-          }
-          if (options?.shutdownOcrAfter) {
-            await shutdownOcr();
-            await shutdownVision();
-          }
-          return { success: true, method: storedIndexMethod(known.method) };
+    store = await SearchStore.open(config.memoryPath);
+    const backup = store.texts;
+    const fileStat = statSync(resolved);
+    const catalog = await loadCatalog(config.memoryPath);
+    if (!catalog.get(resolved)) {
+      const known = backup.rememberMovedFile(resolved, {
+        mtimeMs: fileStat.mtime.getTime(),
+        size: fileStat.size,
+      });
+      if (known) {
+        options?.onProgress?.("indexing", "Storing...");
+        const [embedding] = await getLocalEmbedder().embedDocuments([known.text]);
+        if (!embedding) {
+          throw new Error(`Expected an embedding for ${resolved}.`);
         }
+        store.insertBatch([{ path: resolved, embedding, tags: [] }]);
+        try {
+          catalog.record(
+            resolved,
+            { mtimeMs: fileStat.mtime.getTime(), size: fileStat.size },
+            "indexed"
+          );
+          catalog.save();
+        } catch (catErr) {
+          logger.debug(`Could not update catalog: ${catErr}`);
+        }
+        if (options?.shutdownOcrAfter) {
+          await shutdownOcr();
+          await shutdownVision();
+        }
+        return { success: true, method: storedIndexMethod(known.method) };
       }
     }
 
@@ -801,43 +758,32 @@ export async function indexSingleImage(
       return { success: false, method: "none" };
     }
 
-    if (backup) {
-      backup.upsert({
-        path: resolved,
-        contentHash: hashImageFile(resolved),
-        text: combinedText,
-        title: basename(resolved),
-        mtimeMs: stats.mtime.getTime(),
-        size: stats.size,
-        confidence: ocrConfidence,
-        method,
-      });
-    }
+    backup.upsert({
+      path: resolved,
+      contentHash: hashImageFile(resolved),
+      text: combinedText,
+      title: basename(resolved),
+      mtimeMs: stats.mtime.getTime(),
+      size: stats.size,
+      confidence: ocrConfidence,
+      method,
+      tags: captionTags,
+      width: imageWidth,
+      height: imageHeight,
+    });
 
-    // Get memory (create if needed)
-    const mv = await getMemory({ create: true });
-
-    // Add to index
     options?.onProgress?.("indexing", "Storing...");
-    await putDocuments(mv, [
-      {
-        text: combinedText,
-        title: basename(resolved),
-        uri: resolved,
-        labels: [DOCUMENT_LABEL],
-        tags: captionTags,
-        metadata: {
-          path: resolved,
-          timestamp: stats.mtime.getTime(),
-          fileSize: stats.size,
-          width: imageWidth,
-          height: imageHeight,
-          confidence: ocrConfidence,
-          hasCaption: !!captionText,
-          method,
-        },
-      },
-    ]);
+    const [embedding] = await getLocalEmbedder().embedDocuments([combinedText]);
+    if (!embedding) {
+      throw new Error(`Expected an embedding for ${resolved}.`);
+    }
+    store.insertBatch([{
+      path: resolved,
+      embedding,
+      tags: captionTags,
+      width: imageWidth,
+      height: imageHeight,
+    }]);
 
     // Record in catalog
     try {
@@ -863,7 +809,7 @@ export async function indexSingleImage(
     logger.debug(`Failed to index ${resolved}: ${err}`);
     return { success: false, method: "none" };
   } finally {
-    backup?.close();
+    store?.close();
   }
 }
 
@@ -890,7 +836,7 @@ export async function getIndexStats(): Promise<{
       indexSizeBytes: 0,
       hasLexIndex: false,
       hasVecIndex: false,
-      memoryPath: config.memoryPath,
+      memoryPath: ocrBackupPath(config.memoryPath),
     };
   }
 
@@ -901,6 +847,10 @@ export async function getIndexStats(): Promise<{
     indexSizeBytes: stats.usedBytes,
     hasLexIndex: stats.hasLexIndex,
     hasVecIndex: stats.hasVecIndex,
-    memoryPath: config.memoryPath,
+    memoryPath: stats.memoryPath,
   };
+}
+
+function asMetaNumber(value: unknown): number | null {
+  return typeof value === "number" ? value : null;
 }

@@ -4,10 +4,9 @@
 
 import { basename } from "node:path";
 import chalk from "chalk";
-import { open } from "@memvid/sdk";
-import type { TimelineEntry } from "@memvid/sdk";
 import { loadCatalog, type CatalogEntry } from "../core/catalog.js";
 import { memoryExists } from "../core/memory.js";
+import { SearchStore } from "../core/search-store.js";
 import { formatBytes, formatNumber } from "../display/progress.js";
 import { getConfig, resolvePath, logger } from "../utils/index.js";
 
@@ -80,45 +79,23 @@ export async function browseCommand(
     const offset = (currentPage - 1) * limit;
     const pageSlice = entries.slice(offset, offset + limit);
 
-    // Build preview map (fast path: timeline)
     const previewMap = new Map<string, string>();
     if (memoryExists()) {
       try {
-        const mv = await open(config.memoryPath);
-        const timeline: TimelineEntry[] = await mv.timeline();
-        for (const te of timeline) {
-          if (te.uri) {
-            previewMap.set(te.uri, te.preview ?? "");
+        const store = await SearchStore.open(config.memoryPath);
+        try {
+          const found = store.previews(
+            pageSlice.map((entry) => entry.path),
+            options.fullText === true
+          );
+          for (const [filePath, text] of found) {
+            previewMap.set(filePath, text);
           }
-        }
-
-        // Slow path: full text per entry
-        if (options.fullText) {
-          // Build a map of uri -> frame_id from timeline
-          const frameIdMap = new Map<string, number>();
-          for (const te of timeline) {
-            if (te.uri) {
-              frameIdMap.set(te.uri, te.frame_id);
-            }
-          }
-
-          for (const entry of pageSlice) {
-            if (entry.status === "indexed") {
-              const frameId = frameIdMap.get(entry.path);
-              if (frameId !== undefined) {
-                try {
-                  const fullText = await mv.view(frameId);
-                  previewMap.set(entry.path, fullText);
-                } catch {
-                  // non-fatal: keep existing preview
-                }
-              }
-            }
-          }
+        } finally {
+          store.close();
         }
       } catch (err) {
-        logger.debug(`Could not load memory for previews: ${err}`);
-        // non-fatal: continue without previews
+        logger.debug(`Could not load the index for previews: ${err}`);
       }
     }
 

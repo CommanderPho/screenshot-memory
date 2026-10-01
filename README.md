@@ -36,7 +36,7 @@ A CLI that searches your screenshots by what's *in* them. Text, images, anything
 
 - **OCR** extracts text from screenshots
 - **AI vision** describes photos (local, runs on your machine)
-- **Semantic search** finds things by meaning, not just keywords using memvid
+- **Semantic search** finds things by meaning, not just keywords, using a local SQLite index
 
 No cloud. No API keys. Everything runs locally.
 
@@ -163,7 +163,7 @@ Photo → AI Vision → Description ────┘
               Query → Search → Results
 ```
 
-All stored in a single `.mv2` file. Powered by [memvid](https://github.com/olow/memvid).
+All stored in a local SQLite file next to your screenshot library: full text, a keyword index, and embeddings.
 
 ## Config
 
@@ -187,7 +187,7 @@ Lives at `~/.config/screenshot-memory/config.json`:
 
 **Photos not being described** → Make sure Ollama is running: `ollama serve`
 
-**Semantic index/search failed** → If memvid's local embedding model is unavailable, or macOS CoreML fails while running it (`Unable to compute the prediction using a neural network model`), pull the Ollama fallback (no API key): `ollama serve` then `ollama pull nomic-embed-text`. If an existing index was built with the built-in model, rebuild it with `ssm index --force`.
+**Semantic index/search failed** → Embeddings come from a local Ollama model. Run `ollama serve`, then `ollama pull nomic-embed-text`. If an existing index was built with a different model, rebuild it with `ssm index --force`.
 
 ## License
 
@@ -195,4 +195,4 @@ MIT
 
 ---
 
-Built on [memvid](https://github.com/memvid/memvid)
+Search runs locally in SQLite. Nothing is uploaded.
