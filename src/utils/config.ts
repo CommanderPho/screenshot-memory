@@ -29,6 +29,8 @@ export interface IndexingConfig {
   batchSize: number;
   compressionLevel: number;
   embeddingModel: string;
+  /** Write OCR text to a local SQLite file as well as memvid. */
+  ocrBackup: boolean;
 }
 
 export interface AppConfig {
@@ -85,6 +87,7 @@ const schema = {
       batchSize: { type: "number" as const, default: DEFAULT_CONFIG.indexing.batchSize },
       compressionLevel: { type: "number" as const, default: DEFAULT_CONFIG.indexing.compressionLevel },
       embeddingModel: { type: "string" as const, default: DEFAULT_CONFIG.indexing.embeddingModel },
+      ocrBackup: { type: "boolean" as const, default: DEFAULT_CONFIG.indexing.ocrBackup },
     },
     default: DEFAULT_CONFIG.indexing,
   },

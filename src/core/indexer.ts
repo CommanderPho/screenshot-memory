@@ -12,6 +12,7 @@ import { classifyImages, compareImageRecords, findScreenshotPaths, type ImageSor
 import { initializeOcr, processImage, shutdownOcr, isValidImage, resetOcrWarningDedupe, setOcrWarningHandler } from "../ocr/index.js";
 import { describeImage, shutdownVision, isVisionAvailable } from "../vision/index.js";
 import { putDocuments } from "../embeddings/ollama.js";
+import { OcrBackup, backfillOcrBackup, backfillOcrBackupFile, hashImageFile } from "./ocr-backup.js";
 import {
   getConfig,
   logger,
@@ -100,7 +101,9 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
 async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
   const startTime = Date.now();
   const config = getConfig();
+  let backup: OcrBackup | null = null;
 
+  try {
   options.onProgress?.({
     phase: "scanning",
     current: 0,
@@ -131,6 +134,17 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
   // Load catalog
   const catalog = await loadCatalog(config.memoryPath);
 
+  if (config.indexing.ocrBackup) {
+    backup = await OcrBackup.open(config.memoryPath);
+    if (options.force && memoryExists()) {
+      try {
+        await backfillOcrBackupFile(backup, config.memoryPath);
+      } catch (err) {
+        logger.debug(`OCR backup backfill failed: ${err}`);
+      }
+    }
+  }
+
   if (options.force) {
     catalog.clear();
     clearCatalog(config.memoryPath);
@@ -141,6 +155,14 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
   const mv = isNewIndex
     ? await createMemory()
     : await getMemory({ create: true });
+
+  if (backup && !isNewIndex) {
+    try {
+      await backfillOcrBackup(backup, mv);
+    } catch (err) {
+      logger.debug(`OCR backup backfill failed: ${err}`);
+    }
+  }
 
   // Partition images: already indexed vs to-index
   let toIndex: Array<{ path: string; stat: { mtimeMs: number; size: number } }> = [];
@@ -330,6 +352,47 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
       activeWorkers.set(slotId, fileName);
 
       try {
+        if (backup && !options.force && !catalog.get(item.path)) {
+          const known = backup.rememberMovedFile(item.path, item.stat);
+          if (known) {
+            indexed++;
+            processed++;
+            catalog.record(item.path, item.stat, "indexed");
+            pendingDocs.push({
+              text: known.text,
+              title: fileName,
+              uri: item.path,
+              labels: [DOCUMENT_LABEL],
+              tags: [],
+              metadata: {
+                path: item.path,
+                timestamp: item.stat.mtimeMs,
+                fileSize: item.stat.size,
+                confidence: known.confidence ?? 0,
+                method: known.method ?? "ocr",
+              },
+            });
+            if (pendingDocs.length >= BATCH_INSERT_SIZE) {
+              await flushPendingDocs();
+            }
+            activeWorkers.delete(slotId);
+            options.onProgress?.({
+              phase: "ocr",
+              current: processed,
+              total: toIndex.length,
+              totalFound: imagePaths.length,
+              alreadyIndexed: alreadyIndexedCount,
+              currentFile: fileName,
+              workerCount,
+              activeCount: activeWorkers.size,
+              indexed,
+              skipped: skippedNoText + alreadyIndexedCount + preflightRejected,
+              failed,
+            });
+            return;
+          }
+        }
+
         // Quick validity check (dimensions >= 10px, readable format)
         const valid = await isValidImage(item.path);
         if (!valid) {
@@ -409,6 +472,19 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
         indexed++;
         processed++;
         catalog.record(item.path, item.stat, "indexed");
+
+        if (backup) {
+          backup.upsert({
+            path: item.path,
+            contentHash: hashImageFile(item.path),
+            text,
+            title: fileName,
+            mtimeMs: item.stat.mtimeMs,
+            size: item.stat.size,
+            confidence: ocrResult.confidence,
+            method,
+          });
+        }
 
         pendingDocs.push({
           text,
@@ -527,6 +603,9 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
     memoryPath: config.memoryPath,
     indexSizeBytes: finalStats.usedBytes,
   };
+  } finally {
+    backup?.close();
+  }
 }
 
 /**
@@ -561,8 +640,56 @@ export async function indexSingleImage(
   let method: "ocr" | "caption" | "both" | "none" = "none";
   let imageWidth = 0;
   let imageHeight = 0;
+  let backup: OcrBackup | null = null;
 
   try {
+    if (config.indexing.ocrBackup) {
+      backup = await OcrBackup.open(config.memoryPath);
+      const fileStat = statSync(resolved);
+      const catalog = await loadCatalog(config.memoryPath);
+      if (!catalog.get(resolved)) {
+        const known = backup.rememberMovedFile(resolved, {
+          mtimeMs: fileStat.mtime.getTime(),
+          size: fileStat.size,
+        });
+        if (known) {
+          const mv = await getMemory({ create: true });
+          options?.onProgress?.("indexing", "Storing...");
+          await putDocuments(mv, [
+            {
+              text: known.text,
+              title: basename(resolved),
+              uri: resolved,
+              labels: [DOCUMENT_LABEL],
+              tags: [],
+              metadata: {
+                path: resolved,
+                timestamp: fileStat.mtime.getTime(),
+                fileSize: fileStat.size,
+                confidence: known.confidence ?? 0,
+                method: known.method ?? "ocr",
+              },
+            },
+          ]);
+          try {
+            catalog.record(
+              resolved,
+              { mtimeMs: fileStat.mtime.getTime(), size: fileStat.size },
+              "indexed"
+            );
+            catalog.save();
+          } catch (catErr) {
+            logger.debug(`Could not update catalog: ${catErr}`);
+          }
+          if (options?.shutdownOcrAfter) {
+            await shutdownOcr();
+            await shutdownVision();
+          }
+          return { success: true, method: storedIndexMethod(known.method) };
+        }
+      }
+    }
+
     // Smart strategy: Try vision first (faster for photos), then OCR if needed
     const visionReady = options?.caption !== false && (await isVisionAvailable());
 
@@ -633,6 +760,19 @@ export async function indexSingleImage(
       return { success: false, method: "none" };
     }
 
+    if (backup) {
+      backup.upsert({
+        path: resolved,
+        contentHash: hashImageFile(resolved),
+        text: combinedText,
+        title: basename(resolved),
+        mtimeMs: stats.mtime.getTime(),
+        size: stats.size,
+        confidence: ocrConfidence,
+        method,
+      });
+    }
+
     // Get memory (create if needed)
     const mv = await getMemory({ create: true });
 
@@ -681,7 +821,14 @@ export async function indexSingleImage(
     }
     logger.debug(`Failed to index ${resolved}: ${err}`);
     return { success: false, method: "none" };
+  } finally {
+    backup?.close();
   }
+}
+
+function storedIndexMethod(method: string | null): "ocr" | "caption" | "both" {
+  if (method === "caption" || method === "both" || method === "ocr") return method;
+  return "ocr";
 }
 
 /**

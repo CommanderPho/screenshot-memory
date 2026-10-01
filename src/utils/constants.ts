@@ -47,6 +47,7 @@ export const DEFAULT_CONFIG = {
     batchSize: 100,
     compressionLevel: 3,
     embeddingModel: "bge-small" as const,
+    ocrBackup: true,
   },
 } as const;
 
