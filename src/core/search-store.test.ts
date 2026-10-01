@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { OcrBackup } from "./ocr-backup.js";
 import { reciprocalRankFusion } from "./search-store.js";
 import { SearchStore } from "./search-store.js";
 
@@ -74,7 +76,44 @@ describe("sqlite search index", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  test("rebuilds the keyword index for rows stored before FTS existed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ssm-search-prefts-"));
+    const memoryPath = join(dir, "screenshots.mv2");
+    const invoice = join(dir, "invoice.png");
+    const backup = await OcrBackup.open(memoryPath);
+    backup.upsert({
+      path: invoice,
+      contentHash: "invoice",
+      text: "invoice stripe declined for the card",
+      title: "invoice.png",
+      mtimeMs: 1,
+      size: 10,
+    });
+    backup.close();
+
+    const store = await SearchStore.open(memoryPath);
+    try {
+      expect(tableCount(store.path, "ocr_fts_docsize")).toBe(tableCount(store.path, "ocr_text"));
+      store.insertBatch([{ path: invoice, embedding: axis(0) }]);
+      expect(store.isEmbedded(invoice)).toBe(true);
+      expect(store.searchLex("stripe", 1)[0]?.path).toBe(invoice);
+    } finally {
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
+
+function tableCount(sqlitePath: string, table: string): number {
+  const db = new Database(sqlitePath, { readonly: true });
+  try {
+    const row = db.query(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number } | null;
+    return row?.n ?? 0;
+  } finally {
+    db.close();
+  }
+}
 
 function axis(index: number): number[] {
   const vector = new Array<number>(768).fill(0);

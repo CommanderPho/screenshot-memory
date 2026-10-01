@@ -317,8 +317,10 @@ export class SearchStore {
   }
 
   private syncFts(): void {
+    // ocr_fts is an external-content table, so COUNT(*) reads ocr_text and
+    // hides an empty keyword index. ocr_fts_docsize has one row per indexed document.
     const texts = this.db.prepare("SELECT COUNT(*) AS n FROM ocr_text").get();
-    const indexed = this.db.prepare("SELECT COUNT(*) AS n FROM ocr_fts").get();
+    const indexed = this.db.prepare("SELECT COUNT(*) AS n FROM ocr_fts_docsize").get();
     if ((asNumber(texts?.n) ?? 0) !== (asNumber(indexed?.n) ?? 0)) {
       this.db.exec("INSERT INTO ocr_fts(ocr_fts) VALUES('rebuild')");
     }
