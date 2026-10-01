@@ -87,6 +87,11 @@ ssm find "404"
 # Index your screenshots once
 ssm index ~/Screenshots
 
+## Pre-scan to produce a filelist for index to process:
+ssm scan "E:\Dropbox (Personal)\Screenshots\ShareX Screenshots" --out files.txt --rejected rejected.txt
+ssm index --files "files.txt"
+
+
 # Find stuff
 ssm find "kubernetes error"
 ssm find "that figma mockup"

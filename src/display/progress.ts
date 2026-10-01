@@ -162,6 +162,33 @@ export class ProgressTracker {
   }
 
   /**
+   * Print a line above the active progress bar, then redraw the bar in place.
+   */
+  logAbove(message: string): void {
+    if (this.bar) {
+      const bar = this.bar as cliProgress.SingleBar & {
+        terminal: { cursorTo(x?: number | null, y?: number | null): void; clearLine(): void };
+        options: { stream?: NodeJS.WritableStream };
+      };
+      bar.terminal.cursorTo(0);
+      bar.terminal.clearLine();
+      const stream = bar.options.stream ?? process.stderr;
+      stream.write(`${message}\n`);
+      bar.render();
+      return;
+    }
+
+    if (this.spinner) {
+      this.spinner.clear();
+      process.stderr.write(`${message}\n`);
+      this.spinner.render();
+      return;
+    }
+
+    console.log(message);
+  }
+
+  /**
    * Increment progress
    */
   increment(payload?: object): void {

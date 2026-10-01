@@ -229,3 +229,4 @@ export function getOcrEngineName(): string {
 
 // Re-export useful functions
 export { getImageMetadata, isValidImage, preprocessImage } from "./preprocess.js";
+export { setOcrWarningHandler, resetOcrWarningDedupe } from "./tesseract.js";

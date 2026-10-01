@@ -1,25 +1,36 @@
 /**
- * Tesseract.js OCR engine with scheduler for parallel processing
- * Based on Tesseract.js v5+ API
+ * Tesseract.js OCR engine with a worker pool.
+ * Each job is pinned to one worker so stderr lines can be tied to a file.
  */
 
-import { createWorker, createScheduler, type Scheduler, type Worker } from "tesseract.js";
+import "./capture-worker-stderr.js";
+import { createWorker, type Worker } from "tesseract.js";
 import { preprocessImage, preprocessBuffer } from "./preprocess.js";
+import { getCaptureWorkerPath, onWorkerLine } from "./capture-worker-stderr.js";
+import { formatOcrWarning, isBenignOcrNoise } from "./ocr-warnings.js";
 import { OcrError, logger } from "../utils/index.js";
 import { OCR_TIMEOUT, DEFAULT_CONFIG } from "../utils/constants.js";
 import type { OcrEngine, OcrResult, OcrEngineOptions } from "./types.js";
 
+type TessWorker = Worker & { worker?: object };
+
+export type OcrWarningHandler = (imagePath: string, message: string) => void;
+
 class TesseractEngine implements OcrEngine {
   public readonly name = "tesseract";
 
-  private scheduler: Scheduler | null = null;
-  private workers: Worker[] = [];
+  private workers: TessWorker[] = [];
+  private idle: TessWorker[] = [];
+  private waiters: Array<(worker: TessWorker) => void> = [];
+  private activePaths = new WeakMap<object, string>();
+  private seenWarnings = new Set<string>();
+  private warningHandler: OcrWarningHandler | null = null;
   private initialized = false;
   private workerCount: number = DEFAULT_CONFIG.ocr.workers;
   private language: string = DEFAULT_CONFIG.ocr.language;
 
   /**
-   * Initialize the OCR engine with a worker pool using scheduler
+   * Initialize the OCR engine with a worker pool
    */
   async initialize(options?: OcrEngineOptions): Promise<void> {
     const targetWorkers = options?.workers || DEFAULT_CONFIG.ocr.workers;
@@ -39,31 +50,21 @@ class TesseractEngine implements OcrEngine {
     logger.debug(`Initializing Tesseract with ${this.workerCount} workers`);
 
     try {
-      // Create scheduler for parallel processing
-      this.scheduler = createScheduler();
-
-      // Create workers in parallel
-      // In v5+, createWorker takes (langs, oem, options) directly
-      // No separate initialize() or loadLanguage() calls needed
+      const workerPath = getCaptureWorkerPath();
       const workerPromises = Array.from({ length: this.workerCount }, async () => {
         const worker = await createWorker(this.language, 1, {
-          // Suppress Tesseract logs in production
+          workerPath,
           logger: (m) => {
             if (process.env.DEBUG) {
               logger.debug(`Tesseract: ${m.status} ${Math.round((m.progress || 0) * 100)}%`);
             }
           },
         });
-        return worker;
+        return worker as TessWorker;
       });
 
       this.workers = await Promise.all(workerPromises);
-
-      // Add workers to scheduler
-      for (const worker of this.workers) {
-        this.scheduler.addWorker(worker);
-      }
-
+      this.idle = [...this.workers];
       this.initialized = true;
       logger.debug(`Tesseract initialized with ${this.workers.length} workers`);
     } catch (err) {
@@ -73,22 +74,48 @@ class TesseractEngine implements OcrEngine {
     }
   }
 
+  setWarningHandler(handler: OcrWarningHandler | null): void {
+    this.warningHandler = handler;
+  }
+
+  resetWarnings(): void {
+    this.seenWarnings.clear();
+  }
+
+  /**
+   * Attribute a captured worker line to the file that worker is processing.
+   */
+  handleWorkerLine(nodeWorker: object, line: string): void {
+    const imagePath = this.activePaths.get(nodeWorker);
+    if (!imagePath) return;
+
+    const message = formatOcrWarning(line);
+    if (!message) {
+      if (!isBenignOcrNoise(line)) {
+        logger.debug(`tesseract: ${line.trim()}`);
+      }
+      return;
+    }
+
+    const key = `${imagePath}\0${message}`;
+    if (this.seenWarnings.has(key)) return;
+    this.seenWarnings.add(key);
+    this.warningHandler?.(imagePath, message);
+  }
+
   /**
    * Recognize text from an image file
    */
   async recognize(imagePath: string): Promise<OcrResult> {
-    if (!this.initialized || !this.scheduler) {
+    if (!this.initialized || this.workers.length === 0) {
       await this.initialize();
     }
 
     const startTime = Date.now();
 
     try {
-      // Preprocess the image for better OCR accuracy
       const { buffer, metadata } = await preprocessImage(imagePath);
-
-      // Run OCR with timeout using scheduler
-      const result = await this.recognizeWithTimeout(buffer);
+      const result = await this.recognizeWithTimeout(buffer, imagePath);
 
       return {
         text: result.text.trim(),
@@ -108,18 +135,15 @@ class TesseractEngine implements OcrEngine {
    * Recognize text from a buffer
    */
   async recognizeBuffer(buffer: Buffer): Promise<OcrResult> {
-    if (!this.initialized || !this.scheduler) {
+    if (!this.initialized || this.workers.length === 0) {
       await this.initialize();
     }
 
     const startTime = Date.now();
 
     try {
-      // Preprocess the buffer
       const { buffer: processed, metadata } = await preprocessBuffer(buffer);
-
-      // Run OCR with timeout
-      const result = await this.recognizeWithTimeout(processed);
+      const result = await this.recognizeWithTimeout(processed, "");
 
       return {
         text: result.text.trim(),
@@ -136,97 +160,85 @@ class TesseractEngine implements OcrEngine {
   }
 
   /**
-   * Run OCR with timeout using scheduler.addJob
+   * Run OCR on one pinned worker, with a timeout.
    */
   private async recognizeWithTimeout(
-    buffer: Buffer
+    buffer: Buffer,
+    imagePath: string
   ): Promise<{ text: string; confidence: number }> {
-    if (!this.scheduler) {
-      throw new OcrError("Scheduler not initialized");
+    const worker = await this.acquire();
+    const nodeWorker = worker.worker;
+    if (nodeWorker && imagePath) {
+      this.activePaths.set(nodeWorker, imagePath);
     }
 
-    // Suppress console noise during OCR (Tesseract prints DPI warnings, system prints msgtracer)
-    const originalWarn = console.warn;
-    const originalError = console.error;
-    const originalStderr = process.stderr.write.bind(process.stderr);
-    const originalStdout = process.stdout.write.bind(process.stdout);
+    try {
+      const result = await new Promise<{ text: string; confidence: number }>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new OcrError("OCR timeout exceeded"));
+        }, OCR_TIMEOUT);
 
-    const isNoise = (msg: string) =>
-      msg.includes("resolution") ||
-      msg.includes("dpi") ||
-      msg.includes("msgtracer") ||
-      msg.includes("Context leak") ||
-      msg.includes("Warning:") ||
-      msg.includes("Image too small to scale") ||
-      msg.includes("Line cannot be recognized") ||
-      msg.includes("cannot be recognized") ||
-      msg.includes("min width of");
-
-    console.warn = (...args: unknown[]) => {
-      if (isNoise(String(args[0] || ""))) return;
-      originalWarn.apply(console, args);
-    };
-    console.error = (...args: unknown[]) => {
-      if (isNoise(String(args[0] || ""))) return;
-      originalError.apply(console, args);
-    };
-    process.stderr.write = ((chunk: any, ...args: any[]) => {
-      if (isNoise(String(chunk))) return true;
-      return originalStderr(chunk, ...args);
-    }) as any;
-    process.stdout.write = ((chunk: any, ...args: any[]) => {
-      if (isNoise(String(chunk))) return true;
-      return originalStdout(chunk, ...args);
-    }) as any;
-
-    return new Promise((resolve, reject) => {
-      const restore = () => {
-        console.warn = originalWarn;
-        console.error = originalError;
-        process.stderr.write = originalStderr;
-        process.stdout.write = originalStdout;
-      };
-
-      const timeout = setTimeout(() => {
-        restore();
-        reject(new OcrError("OCR timeout exceeded"));
-      }, OCR_TIMEOUT);
-
-      // Use scheduler.addJob for parallel processing
-      this.scheduler!
-        .addJob("recognize", buffer)
-        .then((result) => {
-          clearTimeout(timeout);
-          restore();
-          resolve({
-            text: result.data.text,
-            confidence: result.data.confidence,
+        worker
+          .recognize(buffer)
+          .then((recognized) => {
+            clearTimeout(timeout);
+            resolve({
+              text: recognized.data.text,
+              confidence: recognized.data.confidence,
+            });
+          })
+          .catch((err: unknown) => {
+            clearTimeout(timeout);
+            reject(err);
           });
-        })
-        .catch((err) => {
-          clearTimeout(timeout);
-          restore();
-          reject(err);
-        });
+      });
+      return result;
+    } finally {
+      await new Promise((resolve) => setImmediate(resolve));
+      if (nodeWorker) {
+        this.activePaths.delete(nodeWorker);
+      }
+      this.release(worker);
+    }
+  }
+
+  private acquire(): Promise<TessWorker> {
+    const worker = this.idle.pop();
+    if (worker) return Promise.resolve(worker);
+    return new Promise((resolve) => {
+      this.waiters.push(resolve);
     });
+  }
+
+  private release(worker: TessWorker): void {
+    const next = this.waiters.shift();
+    if (next) {
+      next(worker);
+    } else {
+      this.idle.push(worker);
+    }
   }
 
   /**
    * Shutdown the OCR engine and release resources
    */
   async shutdown(): Promise<void> {
-    if (this.scheduler) {
-      try {
-        // scheduler.terminate() terminates all workers
-        await this.scheduler.terminate();
-      } catch (err) {
-        logger.debug(`Error terminating scheduler: ${err}`);
-      }
-      this.scheduler = null;
-    }
-
+    const workers = this.workers;
     this.workers = [];
+    this.idle = [];
+    this.waiters = [];
     this.initialized = false;
+
+    await Promise.all(
+      workers.map(async (worker) => {
+        try {
+          await worker.terminate();
+        } catch (err) {
+          logger.debug(`Error terminating worker: ${err}`);
+        }
+      })
+    );
+
     logger.debug("Tesseract shutdown complete");
   }
 
@@ -245,7 +257,6 @@ class TesseractEngine implements OcrEngine {
   }
 }
 
-// Singleton instance
 let instance: TesseractEngine | null = null;
 
 /**
@@ -258,12 +269,30 @@ export function getTesseractEngine(): TesseractEngine {
   return instance;
 }
 
+onWorkerLine((nodeWorker, line) => {
+  getTesseractEngine().handleWorkerLine(nodeWorker, line);
+});
+
 /**
  * Initialize the Tesseract engine
  */
 export async function initializeTesseract(options?: OcrEngineOptions): Promise<void> {
   const engine = getTesseractEngine();
   await engine.initialize(options);
+}
+
+/**
+ * Receive one deduped warning per file and message while OCR is running.
+ */
+export function setOcrWarningHandler(handler: OcrWarningHandler | null): void {
+  getTesseractEngine().setWarningHandler(handler);
+}
+
+/**
+ * Allow the same file to report warnings again on a later index run.
+ */
+export function resetOcrWarningDedupe(): void {
+  getTesseractEngine().resetWarnings();
 }
 
 /**

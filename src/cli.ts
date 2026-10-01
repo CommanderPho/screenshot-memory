@@ -14,11 +14,7 @@ const _isNoise = (s: string) =>
   s.includes("Context leak") ||
   s.includes("msgtracer") ||
   s.includes("Warning: Invalid resolution") ||
-  s.includes("Warning: Invalid dpi") ||
-  s.includes("Image too small to scale") ||
-  s.includes("Line cannot be recognized") ||
-  s.includes("cannot be recognized") ||
-  s.includes("min width of");
+  s.includes("Warning: Invalid dpi");
 
 console.error = (...a: unknown[]) => { if (!_isNoise(String(a[0] || ""))) _origErr.apply(console, a); };
 console.warn = (...a: unknown[]) => { if (!_isNoise(String(a[0] || ""))) _origWarn.apply(console, a); };
@@ -27,7 +23,7 @@ process.stdout.write = ((c: any, ...a: any[]) => _isNoise(String(c)) ? true : _o
 
 import { Command } from "commander";
 import chalk from "chalk";
-import { indexCommand, findCommand, watchCommand, statsCommand, interactiveSearch, ocrCommand, captionCommand, browseCommand } from "./commands/index.js";
+import { indexCommand, findCommand, watchCommand, statsCommand, interactiveSearch, ocrCommand, captionCommand, browseCommand, scanCommand } from "./commands/index.js";
 import { memoryExists } from "./core/memory.js";
 import { APP_VERSION, APP_NAME } from "./utils/constants.js";
 import { setLogLevel } from "./utils/logger.js";
@@ -66,7 +62,21 @@ program
   .option("-c, --caption", "Enable AI image captioning (requires Ollama)")
   .option("--no-caption", "Disable AI image captioning")
   .option("-q, --quiet", "Suppress progress output")
+  .option("--files <list>", "Index only the paths in this file, in listed order")
+  .option("--sort <order>", "Processing order when scanning a directory: newest, oldest, name, size")
+  .option("--min-width <px>", "Skip images narrower than this before OCR")
+  .option("--min-height <px>", "Skip images shorter than this before OCR")
   .action(indexCommand);
+
+program
+  .command("scan [directory]")
+  .description("Check image headers and write an ordered file list for index --files")
+  .option("--out <file>", "Write accepted paths, one per line")
+  .option("--rejected <file>", "Write rejected paths with reasons")
+  .option("--sort <order>", "Order of accepted paths: newest, oldest, name, size", "newest")
+  .option("--min-width <px>", "Minimum image width")
+  .option("--min-height <px>", "Minimum image height")
+  .action(scanCommand);
 
 // Find command
 program

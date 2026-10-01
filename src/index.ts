@@ -46,6 +46,8 @@ export {
   shutdownOcr,
   isOcrInitialized,
   getOcrEngineName,
+  setOcrWarningHandler,
+  resetOcrWarningDedupe,
   type OcrResult,
   type OcrEngineOptions,
 } from "./ocr/index.js";

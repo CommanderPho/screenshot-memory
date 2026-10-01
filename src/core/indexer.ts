@@ -3,20 +3,19 @@
  * Handles batch and incremental indexing of screenshots into memvid
  */
 
-import { glob } from "glob";
 import { statSync, existsSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename } from "node:path";
 import pLimit from "p-limit";
 import { getMemory, createMemory, memoryExists, getMemoryStats } from "./memory.js";
 import { loadCatalog, clearCatalog } from "./catalog.js";
-import { initializeOcr, processImage, shutdownOcr, isValidImage } from "../ocr/index.js";
+import { classifyImages, compareImageRecords, findScreenshotPaths, type ImageSort } from "./preflight.js";
+import { initializeOcr, processImage, shutdownOcr, isValidImage, resetOcrWarningDedupe, setOcrWarningHandler } from "../ocr/index.js";
 import { describeImage, shutdownVision, isVisionAvailable } from "../vision/index.js";
 import { putDocuments } from "../embeddings/ollama.js";
 import {
   getConfig,
   logger,
   resolvePath,
-  SUPPORTED_EXTENSIONS_GLOB,
   DOCUMENT_LABEL,
   BATCH_INSERT_SIZE,
   DirectoryNotFoundError,
@@ -25,8 +24,16 @@ import {
 } from "../utils/index.js";
 
 export interface IndexOptions {
-  /** Directory to index */
-  directory: string;
+  /** Directory to index. Optional when `files` is set. */
+  directory?: string;
+  /** Exact paths to index, in this order. Skips the directory scan and header preflight. */
+  files?: string[];
+  /** Order when scanning a directory. Ignored when `files` is set. */
+  sort?: ImageSort;
+  /** Minimum width for the header preflight. Defaults to MIN_IMAGE_DIMENSION. */
+  minWidth?: number;
+  /** Minimum height for the header preflight. Defaults to MIN_IMAGE_DIMENSION. */
+  minHeight?: number;
   /** Force re-index all files */
   force?: boolean;
   /** Number of OCR workers */
@@ -37,10 +44,12 @@ export interface IndexOptions {
   onProgress?: (progress: IndexProgress) => void;
   /** Error callback for individual files */
   onFileError?: (path: string, error: Error) => void;
+  /** OCR warning tied to the file that produced it */
+  onOcrWarning?: (path: string, message: string) => void;
 }
 
 export interface IndexProgress {
-  phase: "scanning" | "ocr" | "captioning" | "indexing" | "finalizing";
+  phase: "scanning" | "preflight" | "ocr" | "captioning" | "indexing" | "finalizing";
   current: number;
   total: number;
   totalFound?: number;
@@ -59,6 +68,8 @@ export interface IndexResult {
   totalFound: number;
   /** Images skipped because already indexed */
   alreadyIndexed: number;
+  /** Images rejected by the header check before OCR */
+  preflightRejected: number;
   /** Images newly indexed */
   indexed: number;
   /** Images skipped (already indexed or no text) */
@@ -77,18 +88,19 @@ export interface IndexResult {
  * Index screenshots from a directory with incremental change detection and streaming workers
  */
 export async function indexDirectory(options: IndexOptions): Promise<IndexResult> {
+  resetOcrWarningDedupe();
+  setOcrWarningHandler(options.onOcrWarning ?? null);
+  try {
+    return await indexDirectoryImpl(options);
+  } finally {
+    setOcrWarningHandler(null);
+  }
+}
+
+async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
   const startTime = Date.now();
   const config = getConfig();
 
-  // Resolve directory path
-  const directory = resolvePath(options.directory);
-
-  // Validate directory exists
-  if (!existsSync(directory)) {
-    throw new DirectoryNotFoundError(directory);
-  }
-
-  // Report scanning phase
   options.onProgress?.({
     phase: "scanning",
     current: 0,
@@ -96,18 +108,25 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
     message: "Scanning for screenshots...",
   });
 
-  // Find all images
-  const pattern = join(directory, "**", SUPPORTED_EXTENSIONS_GLOB).replace(/\\/g, "/");
-  const imagePaths = await glob(pattern, {
-    nodir: true,
-    absolute: true,
-  });
-
-  if (imagePaths.length === 0) {
-    throw new NoScreenshotsFoundError(directory);
+  let imagePaths: string[];
+  if (options.files) {
+    imagePaths = options.files.map((filePath) => resolvePath(filePath));
+  } else {
+    if (!options.directory) {
+      throw new IndexError("No directory or file list was provided.", "Pass a directory or --files <list>.");
+    }
+    const directory = resolvePath(options.directory);
+    if (!existsSync(directory)) {
+      throw new DirectoryNotFoundError(directory);
+    }
+    imagePaths = await findScreenshotPaths(directory);
   }
 
-  logger.debug(`Found ${imagePaths.length} images in ${directory}`);
+  if (imagePaths.length === 0) {
+    throw new NoScreenshotsFoundError(options.directory || "file list");
+  }
+
+  logger.debug(`Found ${imagePaths.length} images`);
 
   // Load catalog
   const catalog = await loadCatalog(config.memoryPath);
@@ -124,8 +143,9 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
     : await getMemory({ create: true });
 
   // Partition images: already indexed vs to-index
-  const toIndex: Array<{ path: string; stat: { mtimeMs: number; size: number } }> = [];
+  let toIndex: Array<{ path: string; stat: { mtimeMs: number; size: number } }> = [];
   let alreadyIndexedCount = 0;
+  let preflightRejected = 0;
 
   for (const p of imagePaths) {
     try {
@@ -156,6 +176,86 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
       alreadyIndexed: alreadyIndexedCount,
       indexed: 0,
       skipped: alreadyIndexedCount,
+      preflightRejected,
+      failed: 0,
+      timeMs: Date.now() - startTime,
+      memoryPath: config.memoryPath,
+      indexSizeBytes: finalStats.usedBytes,
+    };
+  }
+
+  if (!options.files && options.sort && toIndex.length > 1) {
+    const sort = options.sort;
+    toIndex.sort((a, b) =>
+      compareImageRecords(
+        { path: a.path, mtimeMs: a.stat.mtimeMs, size: a.stat.size },
+        { path: b.path, mtimeMs: b.stat.mtimeMs, size: b.stat.size },
+        sort
+      )
+    );
+  }
+
+  if (!options.files && toIndex.length > 0) {
+    options.onProgress?.({
+      phase: "preflight",
+      current: 0,
+      total: toIndex.length,
+      totalFound: imagePaths.length,
+      alreadyIndexed: alreadyIndexedCount,
+      message: "Checking image headers...",
+    });
+
+    const classified = await classifyImages(
+      toIndex.map((item) => item.path),
+      {
+        minWidth: options.minWidth,
+        minHeight: options.minHeight,
+        onProgress: (current, total) => {
+          options.onProgress?.({
+            phase: "preflight",
+            current,
+            total,
+            totalFound: imagePaths.length,
+            alreadyIndexed: alreadyIndexedCount,
+          });
+        },
+      }
+    );
+
+    const rejected = new Set(classified.rejected.map((item) => item.path));
+    const viable: typeof toIndex = [];
+    for (const item of toIndex) {
+      if (rejected.has(resolvePath(item.path))) {
+        preflightRejected++;
+        catalog.record(item.path, item.stat, "empty");
+      } else {
+        viable.push(item);
+      }
+    }
+    toIndex = viable;
+
+    try {
+      catalog.save();
+    } catch (err) {
+      logger.debug(`Could not save catalog: ${err}`);
+    }
+  }
+
+  if (toIndex.length === 0) {
+    options.onProgress?.({
+      phase: "finalizing",
+      current: 1,
+      total: 1,
+      message: "No screenshots left to process.",
+    });
+
+    const finalStats = await getMemoryStats();
+    return {
+      totalFound: imagePaths.length,
+      alreadyIndexed: alreadyIndexedCount,
+      preflightRejected,
+      indexed: 0,
+      skipped: alreadyIndexedCount + preflightRejected,
       failed: 0,
       timeMs: Date.now() - startTime,
       memoryPath: config.memoryPath,
@@ -247,7 +347,7 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
             workerCount,
             activeCount: activeWorkers.size,
             indexed,
-            skipped: skippedNoText + alreadyIndexedCount,
+            skipped: skippedNoText + alreadyIndexedCount + preflightRejected,
             failed,
           });
           return;
@@ -299,7 +399,7 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
             workerCount,
             activeCount: activeWorkers.size,
             indexed,
-            skipped: skippedNoText + alreadyIndexedCount,
+            skipped: skippedNoText + alreadyIndexedCount + preflightRejected,
             failed,
           });
           return;
@@ -343,7 +443,7 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
           workerCount,
           activeCount: activeWorkers.size,
           indexed,
-          skipped: skippedNoText + alreadyIndexedCount,
+          skipped: skippedNoText + alreadyIndexedCount + preflightRejected,
           failed,
         });
       } catch (err) {
@@ -363,7 +463,7 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
           workerCount,
           activeCount: activeWorkers.size,
           indexed,
-          skipped: skippedNoText + alreadyIndexedCount,
+          skipped: skippedNoText + alreadyIndexedCount + preflightRejected,
           failed,
         });
       }
@@ -419,8 +519,9 @@ export async function indexDirectory(options: IndexOptions): Promise<IndexResult
   return {
     totalFound: imagePaths.length,
     alreadyIndexed: alreadyIndexedCount,
+    preflightRejected,
     indexed,
-    skipped: skippedNoText + alreadyIndexedCount,
+    skipped: skippedNoText + alreadyIndexedCount + preflightRejected,
     failed,
     timeMs: Date.now() - startTime,
     memoryPath: config.memoryPath,
