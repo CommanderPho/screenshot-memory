@@ -188,6 +188,11 @@ export function nativeEmbeddingsUnavailable(err: unknown): boolean {
   return errorMessage(err).includes(NATIVE_UNAVAILABLE) || coreMlEmbeddingFailure(err);
 }
 
+/** Memvid's built-in ONNX models are not available on Windows. */
+export function platformSupportsNativeEmbeddings(platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== "win32";
+}
+
 /**
  * A multi-document CoreML failure should be retried as smaller native batches.
  * A single document, or any other error, is not split.
@@ -278,14 +283,20 @@ async function putNativeBatch(
 
 /**
  * Store documents with memvid's ONNX embedder when this build supports it.
- * If the native library reports that local models are unavailable, or a single
- * document still fails on CoreML in an empty index, retry with Ollama and keep
- * using Ollama for the rest of the process.
+ * Windows skips that embedder and uses Ollama. If the native library reports
+ * that local models are unavailable, or a single document still fails on CoreML
+ * in an empty index, retry with Ollama and keep using Ollama for the rest of
+ * the process.
  */
 export async function putDocuments(mv: Memvid, documents: PutManyInput[]): Promise<void> {
   const config = getConfig();
   const compressionLevel = config.indexing.compressionLevel;
   const embeddingModel = memvidEmbeddingModel(config.indexing.embeddingModel);
+
+  if (nativeLocalEmbeddings !== false && !platformSupportsNativeEmbeddings()) {
+    nativeLocalEmbeddings = false;
+    logger.debug(`Native local embeddings are not available on Windows; using Ollama model '${OLLAMA_EMBED_MODEL}'`);
+  }
 
   if (nativeLocalEmbeddings !== false) {
     try {

@@ -102,6 +102,21 @@ export async function indexCommand(
   // Create progress tracker
   const progress = new ProgressTracker();
   let lastPhase: IndexProgress["phase"] | null = null;
+  const abort = new AbortController();
+  let stopRequests = 0;
+  const onStop = () => {
+    stopRequests += 1;
+    if (stopRequests > 1) {
+      process.exit(130);
+    }
+    if (!abort.signal.aborted && !options.quiet) {
+      console.log();
+      console.log(chalk.yellow("Stopping after the current batch. Press Ctrl+C again to quit immediately."));
+    }
+    abort.abort();
+  };
+  process.on("SIGINT", onStop);
+  process.on("SIGBREAK", onStop);
 
   try {
     const result = await indexDirectory({
@@ -113,6 +128,7 @@ export async function indexCommand(
       force: options.force,
       workers,
       caption: options.caption,
+      signal: abort.signal,
       onOcrWarning: (path, message) => {
         if (!options.quiet) {
           progress.logAbove(chalk.yellow(`${basename(path)} — ${message}`));
@@ -184,7 +200,7 @@ export async function indexCommand(
     });
 
     // Complete progress
-    progress.succeed();
+    progress.succeed(result.stopped ? "Stopped" : undefined);
 
     // Display results
     if (!options.quiet) {
@@ -198,6 +214,9 @@ export async function indexCommand(
       logger.log(chalk.gray(`  ${suggestion}`));
     }
     process.exit(1);
+  } finally {
+    process.off("SIGINT", onStop);
+    process.off("SIGBREAK", onStop);
   }
 }
 
@@ -211,7 +230,12 @@ function displayIndexResult(result: IndexResult): void {
       : undefined;
 
   console.log();
-  console.log(chalk.green.bold("✅ Indexing complete!"));
+  if (result.stopped) {
+    console.log(chalk.yellow.bold("Indexing stopped"));
+    console.log(chalk.gray("   Saved batches will be skipped the next time you run this command."));
+  } else {
+    console.log(chalk.green.bold("✅ Indexing complete!"));
+  }
   console.log();
   console.log(chalk.white.bold("   Summary"));
   console.log(chalk.white(`   Total found:     `) + chalk.cyan(`${formatNumber(result.totalFound)} screenshots`));

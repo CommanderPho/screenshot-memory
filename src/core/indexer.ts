@@ -47,6 +47,8 @@ export interface IndexOptions {
   onFileError?: (path: string, error: Error) => void;
   /** OCR warning tied to the file that produced it */
   onOcrWarning?: (path: string, message: string) => void;
+  /** Stop scheduling new files, then flush and commit what is already done. */
+  signal?: AbortSignal;
 }
 
 export interface IndexProgress {
@@ -83,6 +85,8 @@ export interface IndexResult {
   memoryPath: string;
   /** Index size in bytes */
   indexSizeBytes: number;
+  /** True when the run stopped because `signal` aborted (Ctrl+C). */
+  stopped?: boolean;
 }
 
 /**
@@ -317,29 +321,43 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
   let skippedNoText = 0;
   let failed = 0;
 
-  // Buffer for periodic batch insertion into Memvid
+  // Queued documents are not catalogued until put + seal succeed.
   const pendingDocs: Array<{
-    title: string;
-    text: string;
-    uri: string;
-    labels: string[];
-    tags: string[];
-    metadata: Record<string, unknown>;
+    path: string;
+    stat: { mtimeMs: number; size: number };
+    doc: {
+      title: string;
+      text: string;
+      uri: string;
+      labels: string[];
+      tags: string[];
+      metadata: Record<string, unknown>;
+    };
   }> = [];
 
   let isFlushing = false;
-  let flushError: Error | null = null;
+  let storageError: Error | null = null;
+
+  function indexingStopped(): boolean {
+    return options.signal?.aborted === true || storageError !== null;
+  }
 
   async function flushPendingDocs() {
-    if (pendingDocs.length === 0 || isFlushing) return;
+    if (pendingDocs.length === 0 || isFlushing || storageError) return;
     isFlushing = true;
     const chunk = pendingDocs.splice(0, pendingDocs.length);
     try {
-      await putDocuments(mv, chunk);
+      await putDocuments(mv, chunk.map((item) => item.doc));
+      // Commit before the skip list. A crash must not mark files indexed that
+      // a new process cannot see, and seal() leaves this handle writable.
+      await mv.seal();
+      for (const item of chunk) {
+        catalog.record(item.path, item.stat, "indexed");
+      }
       catalog.save();
     } catch (err) {
-      flushError = err instanceof Error ? err : new Error(String(err));
-      logger.debug(`Error flushing documents to memory: ${flushError.message}`);
+      storageError = err instanceof Error ? err : new Error(String(err));
+      throw storageError;
     } finally {
       isFlushing = false;
     }
@@ -347,6 +365,8 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
 
   const tasks = toIndex.map((item) =>
     limit(async () => {
+      if (indexingStopped()) return;
+
       const slotId = ++workerSlotCounter;
       const fileName = basename(item.path);
       activeWorkers.set(slotId, fileName);
@@ -357,19 +377,22 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
           if (known) {
             indexed++;
             processed++;
-            catalog.record(item.path, item.stat, "indexed");
             pendingDocs.push({
-              text: known.text,
-              title: fileName,
-              uri: item.path,
-              labels: [DOCUMENT_LABEL],
-              tags: [],
-              metadata: {
-                path: item.path,
-                timestamp: item.stat.mtimeMs,
-                fileSize: item.stat.size,
-                confidence: known.confidence ?? 0,
-                method: known.method ?? "ocr",
+              path: item.path,
+              stat: item.stat,
+              doc: {
+                text: known.text,
+                title: fileName,
+                uri: item.path,
+                labels: [DOCUMENT_LABEL],
+                tags: [],
+                metadata: {
+                  path: item.path,
+                  timestamp: item.stat.mtimeMs,
+                  fileSize: item.stat.size,
+                  confidence: known.confidence ?? 0,
+                  method: known.method ?? "ocr",
+                },
               },
             });
             if (pendingDocs.length >= BATCH_INSERT_SIZE) {
@@ -468,10 +491,9 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
           return;
         }
 
-        // Success: queue document
+        // Success: queue document. The catalog entry is written after the batch commits.
         indexed++;
         processed++;
-        catalog.record(item.path, item.stat, "indexed");
 
         if (backup) {
           backup.upsert({
@@ -487,19 +509,23 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
         }
 
         pendingDocs.push({
-          text,
-          title: fileName,
-          uri: item.path,
-          labels: [DOCUMENT_LABEL],
-          tags,
-          metadata: {
-            path: item.path,
-            timestamp: item.stat.mtimeMs,
-            fileSize: item.stat.size,
-            width: ocrResult.metadata.width,
-            height: ocrResult.metadata.height,
-            confidence: ocrResult.confidence,
-            method,
+          path: item.path,
+          stat: item.stat,
+          doc: {
+            text,
+            title: fileName,
+            uri: item.path,
+            labels: [DOCUMENT_LABEL],
+            tags,
+            metadata: {
+              path: item.path,
+              timestamp: item.stat.mtimeMs,
+              fileSize: item.stat.size,
+              width: ocrResult.metadata.width,
+              height: ocrResult.metadata.height,
+              confidence: ocrResult.confidence,
+              method,
+            },
           },
         });
 
@@ -523,6 +549,7 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
           failed,
         });
       } catch (err) {
+        if (storageError) throw storageError;
         failed++;
         processed++;
         catalog.record(item.path, item.stat, "failed");
@@ -546,18 +573,21 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
     })
   );
 
-  await Promise.all(tasks);
+  await Promise.allSettled(tasks);
 
-  // Flush remaining queued documents
-  while (pendingDocs.length > 0) {
-    await flushPendingDocs();
+  try {
+    if (!storageError) {
+      while (pendingDocs.length > 0) {
+        await flushPendingDocs();
+      }
+    }
+  } catch (err) {
+    if (!storageError) {
+      storageError = err instanceof Error ? err : new Error(String(err));
+    }
   }
 
-  if (flushError) {
-    throw new IndexError(`Failed to store documents: ${(flushError as Error).message}`);
-  }
-
-  // Save final catalog
+  // Persist empty/failed rows even when a batch could not be stored.
   try {
     catalog.save();
   } catch (err) {
@@ -568,13 +598,21 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
   await shutdownOcr();
   await shutdownVision();
 
-  // Finalize index
-  options.onProgress?.({
-    phase: "finalizing",
-    current: 0,
-    total: 1,
-    message: "Optimizing index...",
-  });
+  if (storageError) {
+    throw new IndexError(`Failed to store documents: ${storageError.message}`);
+  }
+
+  const stopped = options.signal?.aborted === true;
+
+  if (!stopped) {
+    // Finalize index
+    options.onProgress?.({
+      phase: "finalizing",
+      current: 0,
+      total: 1,
+      message: "Optimizing index...",
+    });
+  }
 
   try {
     await mv.seal();
@@ -582,12 +620,14 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
     logger.debug(`Finalization warning: ${err}`);
   }
 
-  options.onProgress?.({
-    phase: "finalizing",
-    current: 1,
-    total: 1,
-    message: "Done!",
-  });
+  if (!stopped) {
+    options.onProgress?.({
+      phase: "finalizing",
+      current: 1,
+      total: 1,
+      message: "Done!",
+    });
+  }
 
   // Get final stats
   const finalStats = await getMemoryStats();
@@ -599,6 +639,7 @@ async function indexDirectoryImpl(options: IndexOptions): Promise<IndexResult> {
     indexed,
     skipped: skippedNoText + alreadyIndexedCount + preflightRejected,
     failed,
+    stopped,
     timeMs: Date.now() - startTime,
     memoryPath: config.memoryPath,
     indexSizeBytes: finalStats.usedBytes,

@@ -3,6 +3,7 @@ import {
   coreMlEmbeddingFailure,
   memvidEmbeddingModel,
   nativeEmbeddingsUnavailable,
+  platformSupportsNativeEmbeddings,
   shouldRetrySmallerNativeBatch,
 } from "./ollama.js";
 
@@ -39,6 +40,17 @@ describe("nativeEmbeddingsUnavailable", () => {
 
   test("accepts a string error", () => {
     expect(nativeEmbeddingsUnavailable("not available on this platform")).toBe(true);
+  });
+});
+
+describe("platformSupportsNativeEmbeddings", () => {
+  test("skips the built-in embedder on Windows", () => {
+    expect(platformSupportsNativeEmbeddings("win32")).toBe(false);
+  });
+
+  test("keeps the built-in embedder on macOS and Linux", () => {
+    expect(platformSupportsNativeEmbeddings("darwin")).toBe(true);
+    expect(platformSupportsNativeEmbeddings("linux")).toBe(true);
   });
 });
 
