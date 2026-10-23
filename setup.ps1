@@ -137,6 +137,16 @@ if ($Remove -or $Uninstall) {
         }
     }
 
+    $startMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\screenshot-memory"
+    if (Test-Path $startMenuDir) {
+        try {
+            Remove-Item -Path $startMenuDir -Recurse -Force -ErrorAction SilentlyContinue
+            print_success "Removed Start Menu shortcuts: $startMenuDir"
+        } catch {
+            print_warning "Failed to remove Start Menu shortcuts: $startMenuDir"
+        }
+    }
+
     # Remove Windows data, cache and config directories
     $dataDirs = @(
         (Join-Path $env:APPDATA "screenshot-memory"),
@@ -519,6 +529,29 @@ print_success "Created 'ssm' command at $targetBinDir\ssm.cmd"
 print_success "Created 'ssm' command at $targetBinDir\ssm.ps1"
 
 # ============================================
+# Step 7: Start Menu tray shortcut
+# ============================================
+print_header "Step 7: Tray Shortcut"
+
+$trayVbs = Join-Path $PSScriptRoot "scripts\windows\Start-SsmTray.vbs"
+$startMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\screenshot-memory"
+$startMenuLnk = Join-Path $startMenuDir "Scan and Index (tray).lnk"
+
+if (Test-Path $trayVbs) {
+    print_step "Creating Start Menu shortcut..."
+    New-Item -ItemType Directory -Path $startMenuDir -Force | Out-Null
+    $wsh = New-Object -ComObject WScript.Shell
+    $shortcut = $wsh.CreateShortcut($startMenuLnk)
+    $shortcut.TargetPath = $trayVbs
+    $shortcut.WorkingDirectory = Split-Path -Parent $trayVbs
+    $shortcut.Description = "screenshot-memory tray: Scan and Index"
+    $shortcut.Save()
+    print_success "Start Menu: $startMenuLnk"
+} else {
+    print_warning "Tray launcher not found at $trayVbs"
+}
+
+# ============================================
 # Done!
 # ============================================
 print_header "Setup Complete!"
@@ -537,6 +570,10 @@ Write-Host "     ${WHITE}ssm find `"red car`"${NC}"
 Write-Host ""
 Write-Host "  ${CYAN}3.${NC} Auto-index new screenshots:"
 Write-Host "     ${WHITE}ssm watch${NC}"
+Write-Host ""
+Write-Host "  ${CYAN}4.${NC} Tray Scan and Index (Windows):"
+Write-Host "     ${WHITE}Start Menu → screenshot-memory → Scan and Index (tray)${NC}"
+Write-Host "     ${WHITE}or double-click scripts\windows\Start-SsmTray.vbs${NC}"
 Write-Host ""
 Write-Host "${CYAN}Documentation:${NC} https://github.com/memvid/screenshot-memory"
 Write-Host ""

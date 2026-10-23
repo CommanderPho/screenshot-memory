@@ -88,8 +88,8 @@ ssm find "404"
 ssm index ~/Screenshots
 
 ## Pre-scan to produce a filelist for index to process:
-ssm scan "E:\Dropbox (Personal)\Screenshots\ShareX Screenshots" --out files.txt --rejected rejected.txt
-ssm index --files "files.txt"
+ssm scan "E:\Dropbox (Personal)\Screenshots\ShareX Screenshots" --out 2026-10-07_files.txt --rejected 2026-10-07_rejected.txt
+ssm index --files "2026-10-07_files.txt"
 
 
 # Find stuff
@@ -104,6 +104,16 @@ ssm find "sunset at the beach"
 # Watch for new screenshots
 ssm watch
 ```
+
+### Windows tray (Scan and Index)
+
+On Windows you can keep a tray icon that runs the same scan-then-index flow from a menu:
+
+1. Double-click [`scripts/windows/Start-SsmTray.vbs`](scripts/windows/Start-SsmTray.vbs), or use **Start Menu → screenshot-memory → Scan and Index (tray)** after `setup.ps1`.
+2. Right-click the tray icon → **Scan and Index**.
+3. A console opens with the live progress bar. **Show Progress** focuses that window (or opens the latest run log). **Open Lists Folder** opens `%LOCALAPPDATA%\screenshot-memory\Data\lists`, where dated `*_files.txt`, `*_rejected.txt`, and `*_run.log` are written.
+
+The scan uses the first directory from your ssm config (same as `ssm scan` with no path). Only one run at a time; Exit is blocked while indexing.
 
 ## The photo thing
 
